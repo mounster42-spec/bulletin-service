@@ -188,6 +188,13 @@ def poste_group(poste: str) -> str:
     return "LAPI" if poste in C.LAPI_SET else poste
 
 
+def nrm_team(value: Any) -> str:
+    """Normalise un nom d’équipe : '\u00c9quipe 1' → '1', 'A' → 'a'."""
+    s = str(value or "").strip()
+    parts = s.split()
+    return parts[-1].lower() if parts else ""
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # PARSING DU PAYLOAD
 # ─────────────────────────────────────────────────────────────────────────────
@@ -513,7 +520,7 @@ def is_slot_eligible(agent: dict, slot: dict, demi: str, restrictions: dict, vol
         return False
     # H8 : équipe forcée
     req_team = slot.get("required_team")
-    if req_team and agent.get("equipe") != req_team:
+    if req_team and nrm_team(agent.get("equipe")) != nrm_team(req_team):
         return False
     # S3 : volontaires bloqués sur LAPI si quota = 0
     if agent["heures_sup"]:
@@ -686,8 +693,8 @@ def solve_named(
                     r.append("non habilité Accueil")
                 elif poste in ("Suiveuse", "Terrain") and ag.get("heures_sup"):
                     r.append("heures_sup→exclu Suiveuse/Terrain")
-                elif slot.get("required_team") and ag.get("equipe") != slot.get("required_team"):
-                    r.append(f"équipe '{ag.get('equipe')}' ≠ '{slot.get('required_team')}'")
+                elif slot.get("required_team") and nrm_team(ag.get("equipe")) != nrm_team(slot.get("required_team")):
+                    r.append(f"équipe '{ag.get('equipe')}' ≠ '{slot.get('required_team')}' (nrm: '{nrm_team(ag.get('equipe'))}' ≠ '{nrm_team(slot.get('required_team'))}')")
                 elif ag["heures_sup"] and poste == "LAPI1" and not vol_targets.get("allow_lapi1"):
                     r.append("heures_sup quota LAPI1=0")
                 elif ag["heures_sup"] and poste == "LAPI2" and not vol_targets.get("allow_lapi2"):

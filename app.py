@@ -406,7 +406,24 @@ def parse_history(payload: dict) -> dict:
 # ÉQUITÉ — CIBLES AUTO-AJUSTÉES (S1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, int]) -> Dict[str, dict]:
+_FORBIDDEN_GROUP_POSTES: Dict[str, List[str]] = {
+    "LAPI": ["LAPI", "LAPI1", "LAPI2"],
+    "Terrain": ["Terrain"],
+    "Suiveuse": ["Suiveuse"],
+    "Back-office": ["Back-office"],
+}
+
+
+def _is_group_forbidden(key: str, group: str, demi: str, restrictions: dict) -> bool:
+    """Vérifie si l'agent est interdit de tout poste du groupe donné."""
+    for poste in _FORBIDDEN_GROUP_POSTES.get(group, []):
+        if is_forbidden(key, poste, demi, restrictions):
+            return True
+    return False
+
+
+def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, int],
+                     restrictions: dict = None, demi: str = "") -> Dict[str, dict]:
     """
     Pour chaque agent : calcule le déficit par groupe (cible - ratio observé).
     Cible = alpha × cible_fixe + (1 - alpha) × ratio_moyen_historique.
@@ -451,20 +468,26 @@ def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, i
         agent_counts = h_counts.get(key, {})
         is_new = pres <= 3
 
+        forbidden_groups: Set[str] = set()
+        if restrictions:
+            forbidden_groups = {g for g in active_groups if _is_group_forbidden(key, g, demi, restrictions)}
+
         deficit: Dict[str, Any] = {}
         for group in active_groups:
+            if group in forbidden_groups:
+                deficit[group] = 0.0
+                continue
             fixed_target = C.EQUITY_TARGETS.get(group, session_ratios.get(group, 0.0))
             observed_avg = hist_avg.get(group, fixed_target)
             blended_target = C.EQUITY_ALPHA * fixed_target + (1.0 - C.EQUITY_ALPHA) * observed_avg
             actual = agent_counts.get(group, 0) / pres
             deficit[group] = blended_target - actual
 
-        if deficit:
-            deficit["_priority"] = max(
-                (g for g in deficit if not g.startswith("_")),
-                key=lambda g: deficit[g]
-            )
+        eligible_groups = [g for g in active_groups if g not in forbidden_groups]
+        if eligible_groups:
+            deficit["_priority"] = max(eligible_groups, key=lambda g: deficit[g])
         deficit["_is_new"] = is_new
+        deficit["_forbidden_groups"] = list(forbidden_groups)
         deficits[key] = deficit
 
     return deficits
@@ -732,6 +755,13 @@ def solve_named(
         agent_vars = [variables[(ai, si)] for si in range(len(slots)) if (ai, si) in variables]
         if agent_vars:
             model.Add(sum(agent_vars) <= 1)
+
+    # H_TF : agents interdits de Terrain → affectés obligatoirement à un poste nommé
+    for ai, ag in enumerate(agents):
+        if is_forbidden(ag["key"], "Terrain", demi, restrictions):
+            ag_vars = [variables[(ai, si)] for si in range(len(slots)) if (ai, si) in variables]
+            if ag_vars:
+                model.Add(sum(ag_vars) == 1)
 
     # H3 : incompatibilités (postes nommés seulement — Terrain géré dans build_terrain_groups)
     agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
@@ -1080,7 +1110,7 @@ def build_result(payload: dict) -> dict:
 
     incompatibilities = parse_incompatibilities(payload)
     hist = parse_history(payload)
-    deficits = compute_deficits(agents, hist, counts)
+    deficits = compute_deficits(agents, hist, counts, restrictions, demi)
     vol_targets = compute_volunteer_targets(agents, counts)
 
     # Résolution postes nommés

@@ -676,9 +676,29 @@ def solve_named(
     for si, slot in enumerate(slots):
         slot_vars = [variables[(ai, si)] for ai in eligible_per_slot[si] if (ai, si) in variables]
         if not slot_vars:
+            reasons = []
+            for ag in agents:
+                poste = slot["poste"]
+                r = []
+                if is_forbidden(ag["key"], poste, demi, restrictions):
+                    r.append("poste interdit")
+                elif poste == "Accueil" and not ag.get("accueil_hab"):
+                    r.append("non habilité Accueil")
+                elif poste in ("Suiveuse", "Terrain") and ag.get("heures_sup"):
+                    r.append("heures_sup→exclu Suiveuse/Terrain")
+                elif slot.get("required_team") and ag.get("equipe") != slot.get("required_team"):
+                    r.append(f"équipe '{ag.get('equipe')}' ≠ '{slot.get('required_team')}'")
+                elif ag["heures_sup"] and poste == "LAPI1" and not vol_targets.get("allow_lapi1"):
+                    r.append("heures_sup quota LAPI1=0")
+                elif ag["heures_sup"] and poste == "LAPI2" and not vol_targets.get("allow_lapi2"):
+                    r.append("heures_sup quota LAPI2=0")
+                else:
+                    r.append("raison inconnue")
+                reasons.append(f"{ag['nom']}: {r[0]}")
+            detail = " | ".join(reasons[:15])
             raise ValueError(
                 f"Aucun agent éligible pour '{slot['poste']}' (slot {slot['id']}). "
-                "Vérifiez la présence, les postes interdits, les équipes forcées."
+                f"Détail: {detail}"
             )
         model.Add(sum(slot_vars) == 1)
 

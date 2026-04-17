@@ -40,9 +40,10 @@ ALLOCATION SECTEURS
 """
 
 import os
+import random
 import unicodedata
 from collections import defaultdict
-from itertools import combinations as _iter_comb
+from itertools import combinations as _iter_comb, groupby as _groupby
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from flask import Flask, jsonify, request
@@ -904,7 +905,7 @@ def _partition_geographic(
     return g1, g2
 
 
-def allocate_sectors(affectations: List[dict], payload: dict, hist: dict) -> None:
+def allocate_sectors(affectations: List[dict], payload: dict, hist: dict, attempt: int = 0) -> None:
     workbook = (payload or {}).get("workbook") or {}
     options = (payload or {}).get("options") or {}
 
@@ -929,9 +930,22 @@ def allocate_sectors(affectations: List[dict], payload: dict, hist: dict) -> Non
     terrain_cov = hist.get("terrain_coverage", {})
     recent_lapi_secs = hist.get("last_session_sectors", set())
 
+    rng = random.Random(attempt) if attempt > 0 else None
+
+    def jittered_sort(sectors: List[str], key_fn) -> List[str]:
+        base = sorted(sectors, key=key_fn)
+        if rng is None:
+            return base
+        result: List[str] = []
+        for _, grp in _groupby(base, key=key_fn):
+            g = list(grp)
+            rng.shuffle(g)
+            result.extend(g)
+        return result
+
     def lapi_sort_key(s: str) -> tuple:
         total = lapi_cov.get(s, {}).get("LAPI1", 0) + lapi_cov.get(s, {}).get("LAPI2", 0)
-        return (total, 1 if s in recent_lapi_secs else 0, s)
+        return (total, 1 if s in recent_lapi_secs else 0)
 
     lapi1 = next((a for a in affectations if a["poste"] == "LAPI1"), None)
     lapi2 = next((a for a in affectations if a["poste"] == "LAPI2"), None)
@@ -939,7 +953,7 @@ def allocate_sectors(affectations: List[dict], payload: dict, hist: dict) -> Non
 
     # ── LAPI : équité + partition géographique ────────────────────────────────
     if lapi1 or lapi2:
-        lapi_sorted = sorted(all_sectors, key=lapi_sort_key)
+        lapi_sorted = jittered_sort(all_sectors, lapi_sort_key)
         if lapi1 and lapi2:
             needed = req1 + req2
             if len(lapi_sorted) < needed:
@@ -960,7 +974,7 @@ def allocate_sectors(affectations: List[dict], payload: dict, hist: dict) -> Non
 
     # ── Terrain : équité couverture, secteurs les moins vus en priorité ───────
     terrain_pool = [s for s in all_sectors if s not in used] or list(all_sectors)
-    terrain_sorted = sorted(terrain_pool, key=lambda s: (terrain_cov.get(s, 0), s))
+    terrain_sorted = jittered_sort(terrain_pool, lambda s: (terrain_cov.get(s, 0), s))
 
     terrain_items = [a for a in affectations if a["poste"] == "Terrain"]
     for idx, item in enumerate(terrain_items):
@@ -1043,7 +1057,7 @@ def build_result(payload: dict) -> dict:
     affectations.extend(terrain_groups)
 
     # Allocation des secteurs
-    allocate_sectors(affectations, payload, hist)
+    allocate_sectors(affectations, payload, hist, attempt=int((payload.get("options") or {}).get("sectorAttempt") or 0))
 
     # Avertissements
     warnings = collect_warnings(affectations, hist)
@@ -1081,6 +1095,27 @@ def solve():
         return jsonify({"success": False, "error": str(error)}), 400
     except Exception as error:
         return jsonify({"success": False, "error": str(error)}), 500
+
+
+@app.route("/reshuffle_sectors", methods=["POST"])
+def reshuffle_sectors():
+    payload = request.get_json(silent=True) or {}
+    try:
+        affectations = payload.get("affectations") or []
+        attempt = max(1, int((payload.get("attempt") or 1)))
+        if not affectations:
+            raise ValueError("Aucune affectation fournie.")
+        # Réinitialiser les secteurs
+        for a in affectations:
+            a["secteurs"] = []
+        hist = parse_history(payload)
+        allocate_sectors(affectations, payload, hist, attempt=attempt)
+        warnings = collect_warnings(affectations, hist)
+        return jsonify({"success": True, "affectations": affectations, "warnings": warnings})
+    except ValueError as e:
+        return jsonify({"success": False, "error": str(e)}), 400
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

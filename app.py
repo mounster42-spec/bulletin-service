@@ -733,24 +733,25 @@ def solve_named(
         if agent_vars:
             model.Add(sum(agent_vars) <= 1)
 
-    # H3 : incompatibilités
+    # H3 : incompatibilités (postes nommés seulement — Terrain géré dans build_terrain_groups)
     agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
     for row in incompatibilities:
         a1 = agent_index.get(row["a1"])
         a2 = agent_index.get(row["a2"])
         if a1 is None or a2 is None:
             continue
+        if row["poste"] == "Terrain":
+            continue  # géré dans build_terrain_groups
         check_postes = list(C.LAPI_SET) if row["poste"] == "LAPI" else (
             [row["poste"]] if row["poste"] in C.POSTES_NAMED else C.POSTES_NAMED
         )
         for poste in check_postes:
-            for si, slot in enumerate(slots):
-                if slot["poste"] != poste:
-                    continue
-                v1 = variables.get((a1, si))
-                v2 = variables.get((a2, si))
-                if v1 is not None and v2 is not None:
-                    model.Add(v1 + v2 <= 1)
+            a_slots = [variables[(a1, si)] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a1, si) in variables]
+            b_slots = [variables[(a2, si)] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a2, si) in variables]
+            if a_slots and b_slots:
+                model.Add(sum(a_slots) + sum(b_slots) <= 1)
 
     # S3 : quota global volontaires par poste LAPI
     vol_keys = vol_targets.get("keys", set())
@@ -1097,8 +1098,14 @@ def build_result(payload: dict) -> dict:
         if grouped.get(poste):
             affectations.append({"poste": poste, "agents": grouped[poste], "secteurs": []})
 
-    # Équipes Terrain
-    terrain_groups = build_terrain_groups(remaining, incompatibilities, hist)
+    # Équipes Terrain — exclure les agents ayant "Terrain" interdit
+    terrain_forbidden_keys = {
+        key for key, items in restrictions.items()
+        for item in items
+        if item["poste"] == "Terrain" and (not item["demi"] or item["demi"] == demi)
+    }
+    terrain_pool = [ag for ag in remaining if ag["key"] not in terrain_forbidden_keys]
+    terrain_groups = build_terrain_groups(terrain_pool, incompatibilities, hist)
     affectations.extend(terrain_groups)
 
     # Allocation des secteurs

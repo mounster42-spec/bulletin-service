@@ -377,6 +377,11 @@ def parse_history(payload: dict) -> dict:
             for bk in agents_in_aff:
                 if ak != bk and bk not in avoid_terrain_binomes[ak]:
                     avoid_terrain_binomes[ak].insert(0, bk)
+        # Injecter les secteurs LAPI dans last_session_sectors pour pénaliser leur réutilisation
+        if p in C.LAPI_SET:
+            for sec in (aff or {}).get("secteurs") or []:
+                if sec:
+                    last_session_sectors.add(str(sec).strip())
 
     # Fusionner les binômes Terrain à éviter avec les binômes historiques
     merged_binomes = dict(recent_binomes)

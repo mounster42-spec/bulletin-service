@@ -42,6 +42,7 @@ ALLOCATION SECTEURS
 import os
 import unicodedata
 from collections import defaultdict
+from itertools import combinations as _iter_comb
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from flask import Flask, jsonify, request
@@ -316,8 +317,19 @@ def parse_history(payload: dict) -> dict:
                 break
         recent_binomes[key] = seen
 
+    # terrain_coverage : nb de fois où chaque secteur a été affecté en Terrain
+    terrain_coverage: Dict[str, int] = defaultdict(int)
+    for row in rows:
+        p = nrm_poste((row or {}).get("poste"))
+        if p != "Terrain":
+            continue
+        sec_field = str((row or {}).get("secteur") or "").strip()
+        for sec in [s.strip() for s in sec_field.split("/") if s.strip()]:
+            terrain_coverage[sec] += 1
+
     # last_session : affectation de la toute dernière session (date + demi)
     last_session: Dict[str, str] = {}
+    last_session_sectors: Set[str] = set()  # secteurs LAPI de la dernière session
     if rows:
         last_row = rows[-1]
         last_date = (last_row or {}).get("date")
@@ -333,6 +345,11 @@ def parse_history(payload: dict) -> dict:
                 continue
             for nom in [x.strip() for x in af.split("/") if x.strip()]:
                 last_session[nrm(nom)] = p
+            # Collecter les secteurs LAPI de la dernière session
+            if p in C.LAPI_SET:
+                sec_field = str((row or {}).get("secteur") or "").strip()
+                for sec in [s.strip() for s in sec_field.split("/") if s.strip()]:
+                    last_session_sectors.add(sec)
 
     # avoid_map depuis avoidAffectations (tirage précédent rejeté)
     avoid_map: Dict[str, Set[str]] = defaultdict(set)
@@ -352,7 +369,9 @@ def parse_history(payload: dict) -> dict:
         "recent_postes": recent_postes,
         "recent_binomes": recent_binomes,
         "sector_coverage": dict(sector_coverage),
+        "terrain_coverage": dict(terrain_coverage),
         "last_session": last_session,
+        "last_session_sectors": last_session_sectors,
         "avoid_map": dict(avoid_map),
     }
 
@@ -805,57 +824,147 @@ def build_terrain_groups(remaining: List[dict], incompatibilities: List[dict], h
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ALLOCATION DES SECTEURS (équité couverture)
+# ALLOCATION DES SECTEURS — géographie LAPI + équité Terrain
 # ─────────────────────────────────────────────────────────────────────────────
+
+_AXES = [
+    ({"NE", "NO"}, {"SE", "SO"}),  # axe Nord / Sud
+    ({"NE", "SE"}, {"NO", "SO"}),  # axe Est / Ouest
+]
+
+
+def _axis_opposed(g1: List[str], g2: List[str], zone_map: Dict[str, str]) -> bool:
+    z1 = {zone_map[s] for s in g1 if zone_map.get(s)}
+    z2 = {zone_map[s] for s in g2 if zone_map.get(s)}
+    for side1, side2 in _AXES:
+        if z1 <= side1 and z2 <= side2:
+            return True
+        if z1 <= side2 and z2 <= side1:
+            return True
+    return False
+
+
+def _partition_geographic(
+    pool: List[str], zone_map: Dict[str, str], req1: int, req2: int
+) -> Tuple[List[str], List[str]]:
+    """
+    Partitionne `pool` en deux groupes (req1, req2) en cherchant :
+      1. Split parfait par axe géographique
+      2. Recherche exhaustive C(n, req1) si n ≤ 14
+      3. Fallback glouton
+    Score : (nb_dépassements_≤2zones, total_zones, 0_si_axes_opposés)
+    """
+    n = len(pool)
+    needed = req1 + req2
+    if n < needed:
+        return pool[:req1], pool[req1:req1 + req2]
+
+    # 1. Essai rapide par axe
+    for side1, side2 in _AXES:
+        g1 = [s for s in pool if zone_map.get(s) in side1]
+        g2 = [s for s in pool if zone_map.get(s) in side2]
+        if len(g1) == req1 and len(g2) == req2:
+            return g1, g2
+        if len(g1) == req2 and len(g2) == req1:
+            return g2, g1
+
+    # 2. Recherche exhaustive (pool ≤ 14 secteurs → au plus C(14,4)=1001)
+    if n <= 14:
+        best: Optional[Tuple[List[str], List[str]]] = None
+        best_key: Optional[tuple] = None
+        pool_set = set(pool)
+        for combo in _iter_comb(pool, req1):
+            g1 = list(combo)
+            g2 = [s for s in pool if s not in set(g1)]
+            if len(g2) != req2:
+                continue
+            z1 = {zone_map[s] for s in g1 if zone_map.get(s)}
+            z2 = {zone_map[s] for s in g2 if zone_map.get(s)}
+            over = max(0, len(z1) - 2) + max(0, len(z2) - 2)
+            opp = 0 if _axis_opposed(g1, g2, zone_map) else 1
+            key = (over, len(z1) + len(z2), opp)
+            if best_key is None or key < best_key:
+                best_key = key
+                best = (g1, g2)
+        if best:
+            return best
+
+    # 3. Fallback glouton : remplir g1 depuis les zones les plus représentées
+    by_zone: Dict[str, List[str]] = defaultdict(list)
+    for s in pool:
+        by_zone[zone_map.get(s, "")].append(s)
+    zones_sorted = sorted(by_zone.keys(), key=lambda z: -len(by_zone[z]))
+    g1: List[str] = []
+    for z in zones_sorted:
+        for s in by_zone[z]:
+            if len(g1) < req1:
+                g1.append(s)
+    g1_set = set(g1)
+    g2 = [s for s in pool if s not in g1_set][:req2]
+    return g1, g2
+
 
 def allocate_sectors(affectations: List[dict], payload: dict, hist: dict) -> None:
     workbook = (payload or {}).get("workbook") or {}
     options = (payload or {}).get("options") or {}
 
-    all_sectors = [
-        str((item or {}).get("secteur") or "").strip()
-        for item in workbook.get("secteurs") or []
-        if str((item or {}).get("secteur") or "").strip()
-    ]
+    raw_secteurs = workbook.get("secteurs") or []
+    all_sectors: List[str] = []
+    zone_map: Dict[str, str] = {}
+    for item in raw_secteurs:
+        sec = str((item or {}).get("secteur") or "").strip()
+        zone = str((item or {}).get("zone") or "").strip().upper()
+        if sec:
+            all_sectors.append(sec)
+            if zone:
+                zone_map[sec] = zone
+
     if not all_sectors:
         return
 
     req1 = to_int(options.get("requiredSectorsLAPI1"), C.DEFAULT_SECTORS_LAPI)
     req2 = to_int(options.get("requiredSectorsLAPI2"), C.DEFAULT_SECTORS_LAPI)
 
-    coverage = hist.get("sector_coverage", {})
+    lapi_cov = hist.get("sector_coverage", {})
+    terrain_cov = hist.get("terrain_coverage", {})
+    recent_lapi_secs = hist.get("last_session_sectors", set())
 
-    def cov_score(sec: str) -> int:
-        return coverage.get(sec, {}).get("LAPI1", 0) + coverage.get(sec, {}).get("LAPI2", 0)
-
-    sorted_secs = sorted(all_sectors, key=lambda s: (cov_score(s), s))
+    def lapi_sort_key(s: str) -> tuple:
+        total = lapi_cov.get(s, {}).get("LAPI1", 0) + lapi_cov.get(s, {}).get("LAPI2", 0)
+        return (total, 1 if s in recent_lapi_secs else 0, s)
 
     lapi1 = next((a for a in affectations if a["poste"] == "LAPI1"), None)
     lapi2 = next((a for a in affectations if a["poste"] == "LAPI2"), None)
-
     used: Set[str] = set()
 
-    if lapi1 and lapi2:
-        needed = req1 + req2
-        if len(sorted_secs) < needed:
-            raise ValueError(
-                f"Pas assez de secteurs disponibles : {len(sorted_secs)} disponibles, {needed} requis."
-            )
-        pool = sorted_secs[:needed]
-        lapi1["secteurs"] = pool[:req1]
-        lapi2["secteurs"] = pool[req1: req1 + req2]
-        used.update(lapi1["secteurs"] + lapi2["secteurs"])
-    elif lapi1:
-        lapi1["secteurs"] = sorted_secs[:req1]
-        used.update(lapi1["secteurs"])
-    elif lapi2:
-        lapi2["secteurs"] = sorted_secs[:req2]
-        used.update(lapi2["secteurs"])
+    # ── LAPI : équité + partition géographique ────────────────────────────────
+    if lapi1 or lapi2:
+        lapi_sorted = sorted(all_sectors, key=lapi_sort_key)
+        if lapi1 and lapi2:
+            needed = req1 + req2
+            if len(lapi_sorted) < needed:
+                raise ValueError(
+                    f"Pas assez de secteurs : {len(lapi_sorted)} disponibles, {needed} requis."
+                )
+            pool = lapi_sorted[:needed]
+            g1, g2 = _partition_geographic(pool, zone_map, req1, req2)
+            lapi1["secteurs"] = g1
+            lapi2["secteurs"] = g2
+            used.update(g1 + g2)
+        elif lapi1:
+            lapi1["secteurs"] = lapi_sorted[:req1]
+            used.update(lapi1["secteurs"])
+        else:
+            lapi2["secteurs"] = lapi_sorted[:req2]
+            used.update(lapi2["secteurs"])
 
-    # Secteurs restants pour Terrain
-    terrain_pool = [s for s in all_sectors if s not in used] or all_sectors
-    for idx, item in enumerate(a for a in affectations if a["poste"] == "Terrain"):
-        item["secteurs"] = [terrain_pool[idx % len(terrain_pool)]] if terrain_pool else []
+    # ── Terrain : équité couverture, secteurs les moins vus en priorité ───────
+    terrain_pool = [s for s in all_sectors if s not in used] or list(all_sectors)
+    terrain_sorted = sorted(terrain_pool, key=lambda s: (terrain_cov.get(s, 0), s))
+
+    terrain_items = [a for a in affectations if a["poste"] == "Terrain"]
+    for idx, item in enumerate(terrain_items):
+        item["secteurs"] = [terrain_sorted[idx % len(terrain_sorted)]] if terrain_sorted else []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1,4 +1,3 @@
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))
 """
 Solver V2 — Affectation agents opérations police.
 Flask + OR-Tools CP-SAT

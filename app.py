@@ -101,7 +101,7 @@ class C:
     SC_VOL_BO_BONUS = 1_000_000     # moyen pour orienter vers Back-office
 
     # S5  AvoidAffectations
-    SC_AVOID = 200_000
+    SC_AVOID = 1_200_000
 
     # S6  Soulagement Terrain
     SC_TERRAIN_RELIEF_MULT = 280_000
@@ -361,15 +361,28 @@ def parse_history(payload: dict) -> dict:
 
     # avoid_map depuis avoidAffectations (tirage précédent rejeté)
     avoid_map: Dict[str, Set[str]] = defaultdict(set)
+    avoid_terrain_binomes: Dict[str, List[str]] = defaultdict(list)
     for aff in ((payload or {}).get("options") or {}).get("avoidAffectations") or []:
         p = nrm_poste((aff or {}).get("poste"))
-        if not p:
-            continue
         group = poste_group(p)
+        agents_in_aff = []
         for entry in (aff or {}).get("agents") or []:
             nom = str(entry[0] if isinstance(entry, list) else entry or "").strip()
             if nom:
                 avoid_map[nrm(nom)].add(group)
+                if group == "Terrain":
+                    agents_in_aff.append(nrm(nom))
+        # Injecter les binômes Terrain dans recent_binomes (position 0 = le plus récent)
+        for i, ak in enumerate(agents_in_aff):
+            for bk in agents_in_aff:
+                if ak != bk and bk not in avoid_terrain_binomes[ak]:
+                    avoid_terrain_binomes[ak].insert(0, bk)
+
+    # Fusionner les binômes Terrain à éviter avec les binômes historiques
+    merged_binomes = dict(recent_binomes)
+    for ak, partners in avoid_terrain_binomes.items():
+        merged_binomes[ak] = list(dict.fromkeys(partners + merged_binomes.get(ak, [])))
+    recent_binomes = merged_binomes
 
     return {
         "counts": dict(counts),

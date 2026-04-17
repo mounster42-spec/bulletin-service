@@ -39,6 +39,7 @@ ALLOCATION SECTEURS
   - Respect des cardinalités requises (requiredSectorsLAPI1 / LAPI2)
 """
 
+import math
 import os
 import random
 import unicodedata
@@ -448,13 +449,23 @@ def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, i
         session_ratios["Suiveuse"] = counts_by_slot.get("Suiveuse", 0) / session_total_named
         session_ratios["Back-office"] = counts_by_slot.get("Back-office", 0) / session_total_named
 
-    # Ratio moyen observé dans l'historique global
-    all_counts: Dict[str, int] = defaultdict(int)
-    for agent_counts in hist.get("counts", {}).values():
+    # Point 3 — hist_avg filtré : pour chaque (agent, groupe), exclure si l'agent y est interdit
+    eligible_hist_counts: Dict[str, int] = defaultdict(int)
+    eligible_hist_total: int = 0
+    for k, agent_counts in hist.get("counts", {}).items():
         for g, n in agent_counts.items():
-            all_counts[g] += n
-    total_hist = sum(all_counts.values()) or 1
-    hist_avg: Dict[str, float] = {g: n / total_hist for g, n in all_counts.items()}
+            if not (restrictions and _is_group_forbidden(k, g, demi, restrictions)):
+                eligible_hist_counts[g] += n
+                eligible_hist_total += n
+    hist_avg: Dict[str, float] = {
+        g: n / max(1, eligible_hist_total)
+        for g, n in eligible_hist_counts.items()
+    }
+
+    # Point 5 — alpha adaptatif : décroît vers 0.20 à mesure que l'historique s'accumule
+    # Plus il y a de sessions, plus on fait confiance à l'observé (sans limite fixe)
+    n_sessions = max(hist["presence"].values()) if hist.get("presence") else 0
+    equity_alpha = max(0.20, C.EQUITY_ALPHA / (1.0 + 0.1 * math.log(1.0 + n_sessions)))
 
     active_groups = list(C.EQUITY_TARGETS.keys())
 
@@ -468,22 +479,27 @@ def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, i
         agent_counts = h_counts.get(key, {})
         is_new = pres <= 3
 
+        # Point 4 — Accueil intégré à l'équité pour les agents habilités Accueil
+        agent_active_groups = list(active_groups)
+        if agent.get("accueil_hab"):
+            agent_active_groups.append("Accueil")
+
         forbidden_groups: Set[str] = set()
         if restrictions:
-            forbidden_groups = {g for g in active_groups if _is_group_forbidden(key, g, demi, restrictions)}
+            forbidden_groups = {g for g in agent_active_groups if _is_group_forbidden(key, g, demi, restrictions)}
 
         deficit: Dict[str, Any] = {}
-        for group in active_groups:
+        for group in agent_active_groups:
             if group in forbidden_groups:
                 deficit[group] = 0.0
                 continue
             fixed_target = C.EQUITY_TARGETS.get(group, session_ratios.get(group, 0.0))
             observed_avg = hist_avg.get(group, fixed_target)
-            blended_target = C.EQUITY_ALPHA * fixed_target + (1.0 - C.EQUITY_ALPHA) * observed_avg
+            blended_target = equity_alpha * fixed_target + (1.0 - equity_alpha) * observed_avg
             actual = agent_counts.get(group, 0) / pres
             deficit[group] = blended_target - actual
 
-        eligible_groups = [g for g in active_groups if g not in forbidden_groups]
+        eligible_groups = [g for g in agent_active_groups if g not in forbidden_groups]
         if eligible_groups:
             deficit["_priority"] = max(eligible_groups, key=lambda g: deficit[g])
         deficit["_is_new"] = is_new
@@ -867,9 +883,114 @@ def terrain_pair_score(a: dict, b: dict, hist: dict) -> int:
 
 
 def build_terrain_groups(remaining: List[dict], incompatibilities: List[dict], hist: dict) -> List[dict]:
-    groups = []
-    queue = list(remaining)
+    """
+    Constitue les binômes Terrain via CP-SAT (matching optimal).
+    Préférence forte pour binômes de même équipe, anti-répétition partenaires.
+    Fallback glouton si CP-SAT échoue (infaisabilité ou timeout).
+    """
+    if not remaining:
+        return []
+    if len(remaining) == 1:
+        return [{"poste": "Terrain", "agents": [remaining[0]["nom"]], "secteurs": []}]
 
+    agents_t = list(remaining)
+    n = len(agents_t)
+
+    model = cp_model.CpModel()
+
+    # Variables : y[i,j] = 1 si agents i et j forment un binôme (i < j)
+    y: Dict[Tuple[int, int], Any] = {}
+    for i in range(n):
+        for j in range(i + 1, n):
+            y[i, j] = model.NewBoolVar(f"y_{i}_{j}")
+
+    # Contrainte : chaque agent dans au plus un binôme
+    for i in range(n):
+        partners = [y[min(i, j), max(i, j)] for j in range(n) if j != i]
+        model.Add(sum(partners) <= 1)
+
+    # N pair : chaque agent dans exactement un binôme
+    if n % 2 == 0:
+        for i in range(n):
+            partners = [y[min(i, j), max(i, j)] for j in range(n) if j != i]
+            model.Add(sum(partners) == 1)
+
+    # H : incompatibilités Terrain (paires interdites)
+    for i in range(n):
+        for j in range(i + 1, n):
+            if are_terrain_incompatible(agents_t[i], agents_t[j], incompatibilities):
+                model.Add(y[i, j] == 0)
+
+    # Objectif : maximiser qualité des binômes
+    # S4a — Forte préférence même équipe (2000 >> pénalité répétition max 500)
+    # S4b — Anti-répétition partenaires (fenêtre glissante)
+    # S4c — Bonus existence paire pour N impair (éviter solo)
+    obj_terms = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            sc = 0
+            eq_i = agents_t[i].get("equipe") or ""
+            eq_j = agents_t[j].get("equipe") or ""
+            if eq_i and eq_i == eq_j:
+                sc += 2000
+            ak, bk = agents_t[i]["key"], agents_t[j]["key"]
+            rb_a = hist.get("recent_binomes", {}).get(ak, [])
+            rb_b = hist.get("recent_binomes", {}).get(bk, [])
+            best = -1
+            if bk in rb_a:
+                best = max(best, rb_a.index(bk))
+            if ak in rb_b:
+                best = max(best, rb_b.index(ak))
+            if best >= 0:
+                sc -= max(125, 500 - best * 150)
+            if n % 2 != 0:
+                sc += 5000
+            obj_terms.append(sc * y[i, j])
+
+    if obj_terms:
+        model.Maximize(sum(obj_terms))
+
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = 3.0
+    status = solver.Solve(model)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return _terrain_groups_greedy(agents_t, incompatibilities, hist)
+
+    # Extraire les paires de la solution
+    paired: Set[int] = set()
+    pairs: List[Tuple[int, int]] = []
+    for i in range(n):
+        for j in range(i + 1, n):
+            if solver.Value(y[i, j]):
+                pairs.append((i, j))
+                paired.add(i)
+                paired.add(j)
+
+    groups: List[dict] = [
+        {"poste": "Terrain", "agents": [agents_t[i]["nom"], agents_t[j]["nom"]], "secteurs": []}
+        for i, j in pairs
+    ]
+
+    # Agent solo (N impair) → adjoindre au dernier groupe si compatible
+    for i in range(n):
+        if i not in paired:
+            lone = agents_t[i]
+            if groups and not any(
+                are_terrain_incompatible(lone, {"key": nrm(m), "nom": m}, incompatibilities)
+                for m in groups[-1]["agents"]
+            ):
+                groups[-1]["agents"].append(lone["nom"])
+            else:
+                groups.append({"poste": "Terrain", "agents": [lone["nom"]], "secteurs": []})
+
+    return groups
+
+
+def _terrain_groups_greedy(agents_t: List[dict], incompatibilities: List[dict], hist: dict) -> List[dict]:
+    """Fallback glouton pour build_terrain_groups (si CP-SAT infaisable ou timeout)."""
+    groups = []
+    queue = list(agents_t)
     while len(queue) >= 2:
         first = queue.pop(0)
         best_idx, best_sc = None, float("inf")
@@ -885,10 +1006,8 @@ def build_terrain_groups(remaining: List[dict], incompatibilities: List[dict], h
             continue
         second = queue.pop(best_idx)
         groups.append({"poste": "Terrain", "agents": [first["nom"], second["nom"]], "secteurs": []})
-
     if queue:
         lone = queue[0]
-        # Tenter d'adjoindre au dernier groupe si compatible
         if groups and not any(
             are_terrain_incompatible(lone, {"key": nrm(m), "nom": m}, incompatibilities)
             for m in groups[-1]["agents"]
@@ -896,7 +1015,6 @@ def build_terrain_groups(remaining: List[dict], incompatibilities: List[dict], h
             groups[-1]["agents"].append(lone["nom"])
         else:
             groups.append({"poste": "Terrain", "agents": [lone["nom"]], "secteurs": []})
-
     return groups
 
 

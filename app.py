@@ -409,6 +409,7 @@ def parse_history(payload: dict) -> dict:
 
 _FORBIDDEN_GROUP_POSTES: Dict[str, List[str]] = {
     "LAPI": ["LAPI", "LAPI1", "LAPI2"],
+    "Accueil": ["Accueil"],
     "Terrain": ["Terrain"],
     "Suiveuse": ["Suiveuse"],
     "Back-office": ["Back-office"],
@@ -600,6 +601,7 @@ def score_agent_slot(
     demi: str,
     vol_targets: dict,
     eligible_count: int,
+    deficit_mult: int = C.SC_DEFICIT_MULT,
 ) -> int:
     key = agent["key"]
     poste = slot["poste"]
@@ -615,7 +617,7 @@ def score_agent_slot(
     # ── S1 : Équité / déficit ─────────────────────────────────────────────────
     d = deficits.get(key, {})
     def_val = d.get(group, 0.0)
-    raw_bonus = int(def_val * C.SC_DEFICIT_MULT)
+    raw_bonus = int(def_val * deficit_mult)
     score += max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP, raw_bonus))
     if group == d.get("_priority"):
         score += C.SC_PRIORITY_BONUS
@@ -702,156 +704,7 @@ def build_slots(counts: Dict[str, int], forced_teams: dict) -> List[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SOLVEUR CP-SAT — POSTES NOMMÉS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def solve_named(
-    agents: List[dict],
-    slots: List[dict],
-    hist: dict,
-    deficits: dict,
-    demi: str,
-    restrictions: dict,
-    incompatibilities: List[dict],
-    vol_targets: dict,
-) -> Tuple[List[dict], List[dict]]:
-    """
-    Affecte les agents aux slots nommés via CP-SAT.
-    Retourne (assignments [{poste, agent_nom}], remaining [agent]).
-    """
-    model = cp_model.CpModel()
-
-    # Pré-calcul des candidats éligibles par slot
-    eligible_per_slot: List[List[int]] = []
-    for slot in slots:
-        eligible = [
-            ai for ai, ag in enumerate(agents)
-            if is_slot_eligible(ag, slot, demi, restrictions, vol_targets)
-        ]
-        eligible_per_slot.append(eligible)
-
-    # Variables booléennes x[agent_idx, slot_idx]
-    variables: Dict[Tuple[int, int], Any] = {}
-    for si, slot in enumerate(slots):
-        for ai in eligible_per_slot[si]:
-            variables[(ai, si)] = model.NewBoolVar(f"x_{ai}_{si}")
-
-    # H6 : chaque slot rempli exactement une fois
-    for si, slot in enumerate(slots):
-        slot_vars = [variables[(ai, si)] for ai in eligible_per_slot[si] if (ai, si) in variables]
-        if not slot_vars:
-            reasons = []
-            for ag in agents:
-                poste = slot["poste"]
-                r = []
-                if is_forbidden(ag["key"], poste, demi, restrictions):
-                    r.append("poste interdit")
-                elif poste == "Accueil" and not ag.get("accueil_hab"):
-                    r.append("non habilité Accueil")
-                elif poste in ("Suiveuse", "Terrain") and ag.get("heures_sup"):
-                    r.append("heures_sup→exclu Suiveuse/Terrain")
-                elif slot.get("required_team") and nrm_team(ag.get("equipe")) != nrm_team(slot.get("required_team")):
-                    r.append(f"équipe '{ag.get('equipe')}' ≠ '{slot.get('required_team')}' (nrm: '{nrm_team(ag.get('equipe'))}' ≠ '{nrm_team(slot.get('required_team'))}')")
-                elif ag["heures_sup"] and poste == "LAPI1" and not vol_targets.get("allow_lapi1"):
-                    r.append("heures_sup quota LAPI1=0")
-                elif ag["heures_sup"] and poste == "LAPI2" and not vol_targets.get("allow_lapi2"):
-                    r.append("heures_sup quota LAPI2=0")
-                else:
-                    r.append("raison inconnue")
-                reasons.append(f"{ag['nom']}: {r[0]}")
-            detail = " | ".join(reasons[:15])
-            raise ValueError(
-                f"Aucun agent éligible pour '{slot['poste']}' (slot {slot['id']}). "
-                f"Détail: {detail}"
-            )
-        model.Add(sum(slot_vars) == 1)
-
-    # H7 : chaque agent utilisé au plus une fois
-    for ai in range(len(agents)):
-        agent_vars = [variables[(ai, si)] for si in range(len(slots)) if (ai, si) in variables]
-        if agent_vars:
-            model.Add(sum(agent_vars) <= 1)
-
-    # H_TF : agents interdits de Terrain → affectés obligatoirement à un poste nommé
-    for ai, ag in enumerate(agents):
-        if is_forbidden(ag["key"], "Terrain", demi, restrictions):
-            ag_vars = [variables[(ai, si)] for si in range(len(slots)) if (ai, si) in variables]
-            if ag_vars:
-                model.Add(sum(ag_vars) == 1)
-
-    # H3 : incompatibilités (postes nommés seulement — Terrain géré dans build_terrain_groups)
-    agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
-    for row in incompatibilities:
-        a1 = agent_index.get(row["a1"])
-        a2 = agent_index.get(row["a2"])
-        if a1 is None or a2 is None:
-            continue
-        if row["poste"] == "Terrain":
-            continue  # géré dans build_terrain_groups
-        check_postes = list(C.LAPI_SET) if row["poste"] == "LAPI" else (
-            [row["poste"]] if row["poste"] in C.POSTES_NAMED else C.POSTES_NAMED
-        )
-        for poste in check_postes:
-            a_slots = [variables[(a1, si)] for si, slot in enumerate(slots)
-                       if slot["poste"] == poste and (a1, si) in variables]
-            b_slots = [variables[(a2, si)] for si, slot in enumerate(slots)
-                       if slot["poste"] == poste and (a2, si) in variables]
-            if a_slots and b_slots:
-                model.Add(sum(a_slots) + sum(b_slots) <= 1)
-
-    # S3 : quota global volontaires par poste LAPI
-    vol_keys = vol_targets.get("keys", set())
-    for poste, cap in [("LAPI1", vol_targets.get("lapi1", 0)), ("LAPI2", vol_targets.get("lapi2", 0))]:
-        all_vol_vars = [
-            variables[(ai, si)]
-            for si, slot in enumerate(slots)
-            if slot["poste"] == poste
-            for ai in eligible_per_slot[si]
-            if (ai, si) in variables and agents[ai]["key"] in vol_keys
-        ]
-        if all_vol_vars:
-            model.Add(sum(all_vol_vars) <= max(1, cap))
-
-    # Objectif : maximiser le score total
-    objective_terms = []
-    for si, slot in enumerate(slots):
-        ec = len(eligible_per_slot[si])
-        for ai in eligible_per_slot[si]:
-            if (ai, si) not in variables:
-                continue
-            s = score_agent_slot(agents[ai], slot, hist, deficits, demi, vol_targets, ec)
-            objective_terms.append(s * variables[(ai, si)])
-
-    if objective_terms:
-        model.Maximize(sum(objective_terms))
-
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = C.SOLVER_TIME_SECONDS
-    solver.parameters.num_search_workers = C.SOLVER_WORKERS
-    status = solver.Solve(model)
-
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise ValueError(
-            "Aucune solution faisable trouvée. "
-            "Vérifiez les présences, postes interdits et incompatibilités."
-        )
-
-    assignments = []
-    used: Set[str] = set()
-    for si, slot in enumerate(slots):
-        for ai in eligible_per_slot[si]:
-            var = variables.get((ai, si))
-            if var is not None and solver.Value(var) == 1:
-                assignments.append({"poste": slot["poste"], "agent_nom": agents[ai]["nom"]})
-                used.add(agents[ai]["key"])
-                break
-
-    remaining = [ag for ag in agents if ag["key"] not in used]
-    return assignments, remaining
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# CONSTITUTION DES ÉQUIPES TERRAIN (S4 — rotation binômes)
+# HELPERS TERRAIN — utilisés par solve_all
 # ─────────────────────────────────────────────────────────────────────────────
 
 def are_terrain_incompatible(a: dict, b: dict, incompatibilities: List[dict]) -> bool:
@@ -864,158 +717,273 @@ def are_terrain_incompatible(a: dict, b: dict, incompatibilities: List[dict]) ->
     return False
 
 
-def terrain_pair_score(a: dict, b: dict, hist: dict) -> int:
-    """Score bas = meilleure paire."""
-    ak, bk = a["key"], b["key"]
-    rb_a = hist.get("recent_binomes", {}).get(ak, [])
-    rb_b = hist.get("recent_binomes", {}).get(bk, [])
-    idx_ab = rb_a.index(bk) if bk in rb_a else -1
-    idx_ba = rb_b.index(ak) if ak in rb_b else -1
-    candidates = [i for i in [idx_ab, idx_ba] if i >= 0]
-    best = min(candidates) if candidates else -1
+# ─────────────────────────────────────────────────────────────────────────────
+# SOLVEUR CP-SAT UNIFIÉ — postes nommés + binômes Terrain en un seul modèle
+# ─────────────────────────────────────────────────────────────────────────────
 
-    s = 0
-    if best >= 0:
-        s += max(125, 500 - best * 150)
-    if a.get("equipe") != b.get("equipe"):
-        s += 100
-    return s
+# Constantes pour le scoring Terrain dans le modèle unifié
+_TERRAIN_PAIR_BASE = 1_000      # bonus existence binôme > solo (0)
+_TERRAIN_SAME_TEAM = 2_000      # préférence même équipe (dominant)
+_SC_TERRAIN_PAIR_WEIGHT = 20    # facteur tiebreaker vs score nommé (~60K max)
 
 
-def build_terrain_groups(remaining: List[dict], incompatibilities: List[dict], hist: dict) -> List[dict]:
+def solve_all(
+    agents: List[dict],
+    slots: List[dict],
+    hist: dict,
+    deficits: dict,
+    demi: str,
+    restrictions: dict,
+    incompatibilities: List[dict],
+    vol_targets: dict,
+) -> Tuple[List[dict], List[dict]]:
     """
-    Constitue les binômes Terrain via CP-SAT (matching optimal).
-    Préférence forte pour binômes de même équipe, anti-répétition partenaires.
-    Fallback glouton si CP-SAT échoue (infaisabilité ou timeout).
-    """
-    if not remaining:
-        return []
-    if len(remaining) == 1:
-        return [{"poste": "Terrain", "agents": [remaining[0]["nom"]], "secteurs": []}]
+    Solveur CP-SAT unifié : postes nommés + binômes Terrain en un seul modèle.
 
-    agents_t = list(remaining)
-    n = len(agents_t)
+    Variables :
+      x[ai, si]  – agent ai sur slot nommé si
+      y[ai, bi]  – binôme Terrain (ai < bi, non-incompatibles, non-interdits Terrain)
+      solo[ai]   – agent ai seul en Terrain (score = 0, fallback intra-modèle)
+
+    Contrainte liaison : sum(x[ai]) + sum(y[ai]) + solo[ai] == 1 pour chaque
+    agent terrain-éligible — garantit qu'aucun agent n'est laissé sans affectation.
+
+    Infaisabilité uniquement si un slot nommé ne peut pas être rempli (même
+    comportement que solve_named). Le côté Terrain est toujours faisable via solo.
+
+    Retourne (named_affectations, terrain_groups) directement utilisables.
+    """
+    n = len(agents)
+    n_slots = len(slots)
+
+    # Agents interdits de Terrain → forcés vers un poste nommé (H_TF)
+    terrain_forbidden_keys: Set[str] = {
+        key for key, items in restrictions.items()
+        for item in items
+        if item["poste"] == "Terrain" and (not item["demi"] or item["demi"] == demi)
+    }
+    terrain_eligible: List[int] = [
+        ai for ai in range(n) if agents[ai]["key"] not in terrain_forbidden_keys
+    ]
 
     model = cp_model.CpModel()
 
-    # Variables : y[i,j] = 1 si agents i et j forment un binôme (i < j)
+    # ── Variables postes nommés : x[ai, si] ──────────────────────────────────
+    eligible_per_slot: List[List[int]] = []
+    for slot in slots:
+        eligible = [
+            ai for ai, ag in enumerate(agents)
+            if is_slot_eligible(ag, slot, demi, restrictions, vol_targets)
+        ]
+        eligible_per_slot.append(eligible)
+
+    x: Dict[Tuple[int, int], Any] = {}
+    for si in range(n_slots):
+        for ai in eligible_per_slot[si]:
+            x[ai, si] = model.NewBoolVar(f"x_{ai}_{si}")
+
+    # ── Variables binômes Terrain : y[ai, bi] (ai < bi, paires compatibles) ──
     y: Dict[Tuple[int, int], Any] = {}
-    for i in range(n):
-        for j in range(i + 1, n):
-            y[i, j] = model.NewBoolVar(f"y_{i}_{j}")
+    for idx_a in range(len(terrain_eligible)):
+        ai = terrain_eligible[idx_a]
+        for idx_b in range(idx_a + 1, len(terrain_eligible)):
+            bi = terrain_eligible[idx_b]
+            if not are_terrain_incompatible(agents[ai], agents[bi], incompatibilities):
+                y[ai, bi] = model.NewBoolVar(f"y_{ai}_{bi}")
 
-    # Contrainte : chaque agent dans au plus un binôme
-    for i in range(n):
-        partners = [y[min(i, j), max(i, j)] for j in range(n) if j != i]
-        model.Add(sum(partners) <= 1)
+    # ── Variables solo Terrain : solo[ai] ────────────────────────────────────
+    # Score = 0 dans l'objectif → toujours dominé par un vrai binôme (≥ 500×20)
+    # Utilisé seulement si N_terrain impair ou si tous partenaires incompatibles
+    solo: Dict[int, Any] = {ai: model.NewBoolVar(f"solo_{ai}") for ai in terrain_eligible}
 
-    # N pair : chaque agent dans exactement un binôme
-    if n % 2 == 0:
-        for i in range(n):
-            partners = [y[min(i, j), max(i, j)] for j in range(n) if j != i]
-            model.Add(sum(partners) == 1)
+    # ── H6 : chaque slot nommé rempli exactement une fois ────────────────────
+    for si, slot in enumerate(slots):
+        slot_vars = [x[ai, si] for ai in eligible_per_slot[si] if (ai, si) in x]
+        if not slot_vars:
+            reasons = []
+            for ag in agents:
+                poste = slot["poste"]
+                r = "raison inconnue"
+                if is_forbidden(ag["key"], poste, demi, restrictions):
+                    r = "poste interdit"
+                elif poste == "Accueil" and not ag.get("accueil_hab"):
+                    r = "non habilité Accueil"
+                elif slot.get("required_team") and nrm_team(ag.get("equipe")) != nrm_team(slot.get("required_team")):
+                    r = f"équipe ≠ '{slot.get('required_team')}'"
+                elif ag["heures_sup"] and poste == "LAPI1" and not vol_targets.get("allow_lapi1"):
+                    r = "heures_sup quota LAPI1=0"
+                elif ag["heures_sup"] and poste == "LAPI2" and not vol_targets.get("allow_lapi2"):
+                    r = "heures_sup quota LAPI2=0"
+                reasons.append(f"{ag['nom']}: {r}")
+            raise ValueError(
+                f"Aucun agent éligible pour '{slot['poste']}' (slot {slot['id']}). "
+                f"Détail: {' | '.join(reasons[:12])}"
+            )
+        model.Add(sum(slot_vars) == 1)
 
-    # H : incompatibilités Terrain (paires interdites)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if are_terrain_incompatible(agents_t[i], agents_t[j], incompatibilities):
-                model.Add(y[i, j] == 0)
+    # ── H7 : chaque agent au plus une fois dans les slots nommés ─────────────
+    for ai in range(n):
+        agent_named_vars = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
+        if agent_named_vars:
+            model.Add(sum(agent_named_vars) <= 1)
 
-    # Objectif : maximiser qualité des binômes
-    # S4a — Forte préférence même équipe (2000 >> pénalité répétition max 500)
-    # S4b — Anti-répétition partenaires (fenêtre glissante)
-    # S4c — Bonus existence paire pour N impair (éviter solo)
-    obj_terms = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            sc = 0
-            eq_i = agents_t[i].get("equipe") or ""
-            eq_j = agents_t[j].get("equipe") or ""
-            if eq_i and eq_i == eq_j:
-                sc += 2000
-            ak, bk = agents_t[i]["key"], agents_t[j]["key"]
-            rb_a = hist.get("recent_binomes", {}).get(ak, [])
-            rb_b = hist.get("recent_binomes", {}).get(bk, [])
-            best = -1
-            if bk in rb_a:
-                best = max(best, rb_a.index(bk))
-            if ak in rb_b:
-                best = max(best, rb_b.index(ak))
-            if best >= 0:
-                sc -= max(125, 500 - best * 150)
-            if n % 2 != 0:
-                sc += 5000
-            obj_terms.append(sc * y[i, j])
+    # ── H_TF : agents Terrain-interdits → poste nommé obligatoire ────────────
+    for ai, ag in enumerate(agents):
+        if ag["key"] in terrain_forbidden_keys:
+            ag_vars = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
+            if ag_vars:
+                model.Add(sum(ag_vars) == 1)
 
-    if obj_terms:
-        model.Maximize(sum(obj_terms))
+    # ── H3 : incompatibilités postes nommés ──────────────────────────────────
+    agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
+    for row in incompatibilities:
+        a1 = agent_index.get(row["a1"])
+        a2 = agent_index.get(row["a2"])
+        if a1 is None or a2 is None:
+            continue
+        if row["poste"] == "Terrain":
+            continue
+        check_postes = list(C.LAPI_SET) if row["poste"] == "LAPI" else (
+            [row["poste"]] if row["poste"] in C.POSTES_NAMED else C.POSTES_NAMED
+        )
+        for poste in check_postes:
+            a_slots = [x[a1, si] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a1, si) in x]
+            b_slots = [x[a2, si] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a2, si) in x]
+            if a_slots and b_slots:
+                model.Add(sum(a_slots) + sum(b_slots) <= 1)
 
+    # ── S3 : quota global volontaires LAPI ───────────────────────────────────
+    vol_keys = vol_targets.get("keys", set())
+    for poste, cap in [("LAPI1", vol_targets.get("lapi1", 0)), ("LAPI2", vol_targets.get("lapi2", 0))]:
+        all_vol_vars = [
+            x[ai, si]
+            for si, slot in enumerate(slots)
+            if slot["poste"] == poste
+            for ai in eligible_per_slot[si]
+            if (ai, si) in x and agents[ai]["key"] in vol_keys
+        ]
+        if all_vol_vars:
+            model.Add(sum(all_vol_vars) <= max(1, cap))
+
+    # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
+    # poste nommé OU binôme Terrain OU solo Terrain — aucun agent sans affectation
+    for ai in terrain_eligible:
+        named_i = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
+        pair_i = [
+            y[min(ai, bi), max(ai, bi)]
+            for bi in terrain_eligible
+            if bi != ai and (min(ai, bi), max(ai, bi)) in y
+        ]
+        model.Add(sum(named_i) + sum(pair_i) + solo[ai] == 1)
+
+    # Chaque agent dans au plus un binôme Terrain
+    for ai in terrain_eligible:
+        pair_i = [
+            y[min(ai, bi), max(ai, bi)]
+            for bi in terrain_eligible
+            if bi != ai and (min(ai, bi), max(ai, bi)) in y
+        ]
+        if pair_i:
+            model.Add(sum(pair_i) <= 1)
+
+    # ── Calibration adaptative du multiplicateur déficit ─────────────────────
+    _all_def_abs = [
+        abs(deficits.get(ag["key"], {}).get(g, 0.0))
+        for ag in agents
+        for g in list(C.EQUITY_TARGETS.keys()) + ["Accueil"]
+    ]
+    _max_deficit = max(_all_def_abs) if _all_def_abs else 0.3
+    adaptive_deficit_mult = max(
+        C.SC_DEFICIT_MULT // 2,
+        min(C.SC_DEFICIT_MULT * 4,
+            int(C.SC_DEFICIT_CAP / max(0.001, _max_deficit)))
+    )
+
+    # ── Objectif : score nommés + score binômes (tiebreaker) ─────────────────
+    obj: List[Any] = []
+
+    for si, slot in enumerate(slots):
+        ec = len(eligible_per_slot[si])
+        for ai in eligible_per_slot[si]:
+            if (ai, si) not in x:
+                continue
+            s = score_agent_slot(
+                agents[ai], slot, hist, deficits, demi, vol_targets, ec, adaptive_deficit_mult
+            )
+            obj.append(s * x[ai, si])
+
+    for (ai, bi), var in y.items():
+        sc = _TERRAIN_PAIR_BASE
+        eq_i = agents[ai].get("equipe") or ""
+        eq_j = agents[bi].get("equipe") or ""
+        if eq_i and eq_i == eq_j:
+            sc += _TERRAIN_SAME_TEAM
+        ak, bk = agents[ai]["key"], agents[bi]["key"]
+        rb_a = hist.get("recent_binomes", {}).get(ak, [])
+        rb_b = hist.get("recent_binomes", {}).get(bk, [])
+        best = -1
+        if bk in rb_a:
+            best = max(best, rb_a.index(bk))
+        if ak in rb_b:
+            best = max(best, rb_b.index(ak))
+        if best >= 0:
+            sc -= max(125, 500 - best * 150)
+        obj.append(_SC_TERRAIN_PAIR_WEIGHT * sc * var)
+    # solo[ai] contribue 0 à l'objectif — naturellement évité sauf nécessité
+
+    if obj:
+        model.Maximize(sum(obj))
+
+    # ── Résolution ────────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = 3.0
+    solver.parameters.max_time_in_seconds = C.SOLVER_TIME_SECONDS
+    solver.parameters.num_search_workers = C.SOLVER_WORKERS
     status = solver.Solve(model)
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        return _terrain_groups_greedy(agents_t, incompatibilities, hist)
+        raise ValueError(
+            "Aucune solution faisable trouvée. "
+            "Vérifiez les présences, postes interdits et incompatibilités."
+        )
 
-    # Extraire les paires de la solution
-    paired: Set[int] = set()
-    pairs: List[Tuple[int, int]] = []
-    for i in range(n):
-        for j in range(i + 1, n):
-            if solver.Value(y[i, j]):
-                pairs.append((i, j))
-                paired.add(i)
-                paired.add(j)
+    # ── Extraction postes nommés ──────────────────────────────────────────────
+    named_grouped: Dict[str, List[str]] = defaultdict(list)
+    for si, slot in enumerate(slots):
+        for ai in eligible_per_slot[si]:
+            if (ai, si) in x and solver.Value(x[ai, si]) == 1:
+                named_grouped[slot["poste"]].append(agents[ai]["nom"])
+                break
 
-    groups: List[dict] = [
-        {"poste": "Terrain", "agents": [agents_t[i]["nom"], agents_t[j]["nom"]], "secteurs": []}
-        for i, j in pairs
+    named_affectations: List[dict] = [
+        {"poste": poste, "agents": named_grouped[poste], "secteurs": []}
+        for poste in C.POSTES_NAMED if named_grouped.get(poste)
     ]
 
-    # Agent solo (N impair) → adjoindre au dernier groupe si compatible
-    for i in range(n):
-        if i not in paired:
-            lone = agents_t[i]
-            if groups and not any(
-                are_terrain_incompatible(lone, {"key": nrm(m), "nom": m}, incompatibilities)
-                for m in groups[-1]["agents"]
-            ):
-                groups[-1]["agents"].append(lone["nom"])
-            else:
-                groups.append({"poste": "Terrain", "agents": [lone["nom"]], "secteurs": []})
+    # ── Extraction binômes Terrain ────────────────────────────────────────────
+    terrain_paired: Set[int] = set()
+    terrain_groups: List[dict] = []
+    for (ai, bi), var in y.items():
+        if solver.Value(var) == 1:
+            terrain_groups.append({
+                "poste": "Terrain",
+                "agents": [agents[ai]["nom"], agents[bi]["nom"]],
+                "secteurs": [],
+            })
+            terrain_paired.add(ai)
+            terrain_paired.add(bi)
 
-    return groups
+    # Agents solo (N_terrain impair ou incompatibilités totales)
+    for ai, var in solo.items():
+        if solver.Value(var) == 1:
+            terrain_groups.append({
+                "poste": "Terrain",
+                "agents": [agents[ai]["nom"]],
+                "secteurs": [],
+            })
 
-
-def _terrain_groups_greedy(agents_t: List[dict], incompatibilities: List[dict], hist: dict) -> List[dict]:
-    """Fallback glouton pour build_terrain_groups (si CP-SAT infaisable ou timeout)."""
-    groups = []
-    queue = list(agents_t)
-    while len(queue) >= 2:
-        first = queue.pop(0)
-        best_idx, best_sc = None, float("inf")
-        for idx, cand in enumerate(queue):
-            if are_terrain_incompatible(first, cand, incompatibilities):
-                continue
-            sc = terrain_pair_score(first, cand, hist)
-            if sc < best_sc:
-                best_sc = sc
-                best_idx = idx
-        if best_idx is None:
-            groups.append({"poste": "Terrain", "agents": [first["nom"]], "secteurs": []})
-            continue
-        second = queue.pop(best_idx)
-        groups.append({"poste": "Terrain", "agents": [first["nom"], second["nom"]], "secteurs": []})
-    if queue:
-        lone = queue[0]
-        if groups and not any(
-            are_terrain_incompatible(lone, {"key": nrm(m), "nom": m}, incompatibilities)
-            for m in groups[-1]["agents"]
-        ):
-            groups[-1]["agents"].append(lone["nom"])
-        else:
-            groups.append({"poste": "Terrain", "agents": [lone["nom"]], "secteurs": []})
-    return groups
+    return named_affectations, terrain_groups
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1231,30 +1199,11 @@ def build_result(payload: dict) -> dict:
     deficits = compute_deficits(agents, hist, counts, restrictions, demi)
     vol_targets = compute_volunteer_targets(agents, counts)
 
-    # Résolution postes nommés
-    assignments, remaining = solve_named(
+    # Résolution unifiée : postes nommés + binômes Terrain en un seul modèle CP-SAT
+    named_affectations, terrain_groups = solve_all(
         agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets
     )
-
-    # Construction des affectations nommées
-    grouped: Dict[str, List[str]] = defaultdict(list)
-    for row in assignments:
-        grouped[row["poste"]].append(row["agent_nom"])
-
-    affectations: List[dict] = []
-    for poste in C.POSTES_NAMED:
-        if grouped.get(poste):
-            affectations.append({"poste": poste, "agents": grouped[poste], "secteurs": []})
-
-    # Équipes Terrain — exclure les agents ayant "Terrain" interdit
-    terrain_forbidden_keys = {
-        key for key, items in restrictions.items()
-        for item in items
-        if item["poste"] == "Terrain" and (not item["demi"] or item["demi"] == demi)
-    }
-    terrain_pool = [ag for ag in remaining if ag["key"] not in terrain_forbidden_keys]
-    terrain_groups = build_terrain_groups(terrain_pool, incompatibilities, hist)
-    affectations.extend(terrain_groups)
+    affectations: List[dict] = named_affectations + terrain_groups
 
     # Allocation des secteurs
     allocate_sectors(affectations, payload, hist, attempt=int((payload.get("options") or {}).get("sectorAttempt") or 0))

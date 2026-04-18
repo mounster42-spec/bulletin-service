@@ -516,17 +516,28 @@ def compute_deficits(agents: List[dict], hist: dict, counts_by_slot: Dict[str, i
 
 def compute_volunteer_targets(agents: List[dict], counts: Dict[str, int]) -> dict:
     """
-    Calcule combien de volontaires (heures sup) peuvent aller sur LAPI1 / LAPI2.
-    Règle : ≤2 → tous ; 3 → max 2 ; ≥4 → max 4 (plafonné aux slots disponibles).
+    Calcule combien de volontaires (heures sup) vont sur LAPI1 / LAPI2.
+    Règle : remplir les postes LAPI uniquement par paires complètes.
+      - n < nb1          → quota = 0   (pas assez pour un poste LAPI → tous en BO)
+      - nb1 ≤ n < nb1+nb2 → quota = nb1 (remplit LAPI1, reste en BO)
+      - n ≥ nb1+nb2      → quota = nb1+nb2 (remplit LAPI1 + LAPI2, reste en BO)
+    Exemple (nb1=2, nb2=2) : 1→BO, 2→LAPI1, 3→2 LAPI1+1 BO, 4→LAPI1+LAPI2, 5+→idem+BO.
     """
     volunteers = [a for a in agents if a["heures_sup"]]
     n = len(volunteers)
     if n == 0:
         return {"lapi1": 0, "lapi2": 0, "allow_lapi1": False, "allow_lapi2": False, "keys": set()}
 
-    quota = n if n <= 2 else (2 if n == 3 else min(4, n))
     nb1 = counts.get("LAPI1", 0)
     nb2 = counts.get("LAPI2", 0)
+
+    if n < nb1:
+        quota = 0
+    elif n < nb1 + nb2:
+        quota = nb1
+    else:
+        quota = nb1 + nb2
+
     target = min(quota, nb1 + nb2)
     t1 = min(nb1, target)
     t2 = min(nb2, max(0, target - t1))
@@ -923,11 +934,12 @@ def solve_all(
         ak, bk = agents[ai]["key"], agents[bi]["key"]
         rb_a = hist.get("recent_binomes", {}).get(ak, [])
         rb_b = hist.get("recent_binomes", {}).get(bk, [])
-        best = -1
+        _candidates = []
         if bk in rb_a:
-            best = max(best, rb_a.index(bk))
+            _candidates.append(rb_a.index(bk))
         if ak in rb_b:
-            best = max(best, rb_b.index(ak))
+            _candidates.append(rb_b.index(ak))
+        best = min(_candidates) if _candidates else -1
         if best >= 0:
             sc -= max(125, 500 - best * 150)
         obj.append(_SC_TERRAIN_PAIR_WEIGHT * sc * var)

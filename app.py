@@ -845,6 +845,26 @@ def solve_all(
             if ag_vars:
                 model.Add(sum(ag_vars) == 1)
 
+    # ── H3 : incompatibilités postes nommés ──────────────────────────────────
+    agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
+    for row in incompatibilities:
+        a1 = agent_index.get(row["a1"])
+        a2 = agent_index.get(row["a2"])
+        if a1 is None or a2 is None:
+            continue
+        if row["poste"] == "Terrain":
+            continue
+        check_postes = list(C.LAPI_SET) if row["poste"] == "LAPI" else (
+            [row["poste"]] if row["poste"] in C.POSTES_NAMED else C.POSTES_NAMED
+        )
+        for poste in check_postes:
+            a_slots = [x[a1, si] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a1, si) in x]
+            b_slots = [x[a2, si] for si, slot in enumerate(slots)
+                       if slot["poste"] == poste and (a2, si) in x]
+            if a_slots and b_slots:
+                model.Add(sum(a_slots) + sum(b_slots) <= 1)
+
     # ── S3 : quota global volontaires LAPI ───────────────────────────────────
     vol_keys = vol_targets.get("keys", set())
     for poste, cap in [("LAPI1", vol_targets.get("lapi1", 0)), ("LAPI2", vol_targets.get("lapi2", 0))]:

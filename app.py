@@ -120,6 +120,9 @@ class C:
     # S10 Répétition immédiate (même poste que session précédente)
     SC_IMMEDIATE_REPEAT = 50_000_000  # quasi-dure
 
+    # S11 Anticipation absences PM (tirage Matin d'une Journée)
+    SC_ABSENT_PM_BOOST = 400_000     # préférer agents absents PM pour postes matin
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NORMALISATIONS
@@ -232,14 +235,23 @@ def parse_agents(payload: dict) -> List[dict]:
     return result
 
 
-def parse_counts(payload: dict) -> Dict[str, int]:
+def parse_counts(payload: dict, demi: str = "") -> Dict[str, int]:
     params = ((payload or {}).get("workbook") or {}).get("parametres") or {}
+    is_aprem = "apres" in (demi or "").lower()
+
+    def get_count(key: str, default: int) -> int:
+        val = params.get(key, default)
+        if isinstance(val, dict):
+            k = "aprem" if is_aprem else "matin"
+            return int(val.get(k) or val.get("matin") or default)
+        return to_int(val, default)
+
     return {
-        "LAPI1": to_int(params.get("LAPI 1"), 2),
-        "LAPI2": to_int(params.get("LAPI 2"), 2),
-        "Accueil": to_int(params.get("Accueil"), 2),
-        "Suiveuse": to_int(params.get("Suiveuse"), 1),
-        "Back-office": to_int(params.get("Back-office"), 1),
+        "LAPI1":       get_count("LAPI 1",      2),
+        "LAPI2":       get_count("LAPI 2",      2),
+        "Accueil":     get_count("Accueil",     2),
+        "Suiveuse":    get_count("Suiveuse",    1),
+        "Back-office": get_count("Back-office", 1),
     }
 
 
@@ -747,6 +759,7 @@ def solve_all(
     restrictions: dict,
     incompatibilities: List[dict],
     vol_targets: dict,
+    absent_pm_keys: Set[str] = frozenset(),
 ) -> Tuple[List[dict], List[dict]]:
     """
     Solveur CP-SAT unifié : postes nommés + binômes Terrain en un seul modèle.
@@ -882,48 +895,66 @@ def solve_all(
     # Interdit la réaffectation au même groupe que la session précédente
     # UNIQUEMENT si une alternative existe — jamais d'infaisabilité.
     # Couvre : postes nommés (variables x) ET Terrain (variables y / solo).
+    # Sécurité sous-effectif : si bloquer un agent laisserait un slot sans
+    # aucun candidat (ex. LAPI pool juste), le blocage est levé pour ce slot.
     _recent_postes_h = hist.get("recent_postes", {})
     terrain_eligible_set = set(terrain_eligible)
+
+    # Passe 1 : collecter les blocages candidats sans les poser
+    _named_blocks: List[Tuple[int, int]] = []
+    _terrain_blocks: Set[int] = set()
+
     for ai, agent in enumerate(agents):
         if agent.get("heures_sup"):
-            continue  # les volontaires obéissent à la règle LAPI/BO (S3)
+            continue
         key = agent["key"]
         rp = _recent_postes_h.get(key, [])
         if not rp:
             continue
         last_group = poste_group(rp[0])
-
-        # Slots nommés appartenant au groupe répété
         repeat_si = [
             si for si in range(n_slots)
             if (ai, si) in x and poste_group(slots[si]["poste"]) == last_group
         ]
-        # Variables Terrain concernées si le dernier groupe était Terrain
         repeat_terrain = (last_group == "Terrain" and ai in terrain_eligible_set)
-
         if not repeat_si and not repeat_terrain:
             continue
-
-        # Alternatives disponibles pour cet agent
         other_named_si = [
             si for si in range(n_slots)
             if (ai, si) in x and poste_group(slots[si]["poste"]) != last_group
         ]
-        # Terrain est une alternative uniquement si le groupe répété n'est PAS Terrain
         terrain_is_alt = (ai in terrain_eligible_set and last_group != "Terrain")
-        has_alternative = bool(other_named_si) or terrain_is_alt
-
-        if has_alternative:
+        if bool(other_named_si) or terrain_is_alt:
             for si in repeat_si:
-                model.Add(x[ai, si] == 0)
+                _named_blocks.append((ai, si))
             if repeat_terrain:
-                for bi in terrain_eligible:
-                    if bi != ai:
-                        k = (min(ai, bi), max(ai, bi))
-                        if k in y:
-                            model.Add(y[k[0], k[1]] == 0)
-                if ai in solo:
-                    model.Add(solo[ai] == 0)
+                _terrain_blocks.add(ai)
+
+    # Passe 2 : poser les blocages nommés uniquement si le slot reste faisable
+    _blocked_per_slot: Dict[int, Set[int]] = defaultdict(set)
+    for ai, si in _named_blocks:
+        _blocked_per_slot[si].add(ai)
+
+    for si in range(n_slots):
+        blocked = _blocked_per_slot.get(si, set())
+        if not blocked:
+            continue
+        non_blocked = [a for a in eligible_per_slot[si] if a not in blocked]
+        if non_blocked:
+            for ai in blocked:
+                if (ai, si) in x:
+                    model.Add(x[ai, si] == 0)
+        # sinon : sous-effectif, répétition inévitable — aucun blocage posé
+
+    # Passe 3 : blocages Terrain (toujours sûrs car agent a des postes nommés dispo)
+    for ai in _terrain_blocks:
+        for bi in terrain_eligible:
+            if bi != ai:
+                k = (min(ai, bi), max(ai, bi))
+                if k in y:
+                    model.Add(y[k[0], k[1]] == 0)
+        if ai in solo:
+            model.Add(solo[ai] == 0)
 
     # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
     # poste nommé OU binôme Terrain OU solo Terrain — aucun agent sans affectation
@@ -970,6 +1001,8 @@ def solve_all(
             s = score_agent_slot(
                 agents[ai], slot, hist, deficits, demi, vol_targets, ec, adaptive_deficit_mult
             )
+            if agents[ai]["key"] in absent_pm_keys:
+                s += C.SC_ABSENT_PM_BOOST
             obj.append(s * x[ai, si])
 
     for (ai, bi), var in y.items():
@@ -995,14 +1028,18 @@ def solve_all(
         avg_def = (def_ai + def_bi) * 0.5
         terrain_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
                              int(avg_def * adaptive_deficit_mult)))
-        obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity) * var)
+        absent_boost = C.SC_ABSENT_PM_BOOST if (
+            agents[ai]["key"] in absent_pm_keys or agents[bi]["key"] in absent_pm_keys
+        ) else 0
+        obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity + absent_boost) * var)
     # solo[ai] : équité Terrain individuelle (détermine quel agent va seul si impair)
     for ai, var in solo.items():
         def_ai = deficits.get(agents[ai]["key"], {}).get("Terrain", 0.0)
         solo_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
                           int(def_ai * adaptive_deficit_mult)))
-        if solo_equity:
-            obj.append(solo_equity * var)
+        solo_boost = C.SC_ABSENT_PM_BOOST if agents[ai]["key"] in absent_pm_keys else 0
+        if solo_equity or solo_boost:
+            obj.append((solo_equity + solo_boost) * var)
 
     if obj:
         model.Maximize(sum(obj))
@@ -1252,7 +1289,7 @@ def build_result(payload: dict) -> dict:
     if len(agents) < 2:
         raise ValueError("Pas assez d'agents présents (minimum 2).")
 
-    counts = parse_counts(payload)
+    counts = parse_counts(payload, demi)
     slots = build_slots(counts, forced_teams)
 
     if len(slots) > len(agents):
@@ -1270,9 +1307,18 @@ def build_result(payload: dict) -> dict:
     deficits = compute_deficits(agents, hist, counts, restrictions, demi)
     vol_targets = compute_volunteer_targets(agents, counts)
 
+    # S11 : agents présents Matin mais absents PM → boost matin pour libérer la rotation PM
+    absent_pm_keys: Set[str] = set()
+    if demi == "Matin":
+        for raw in ((payload or {}).get("workbook") or {}).get("agents") or []:
+            nom = str((raw or {}).get("nom") or "").strip()
+            if nom and nrm_bool(raw.get("presentMatin")) and not nrm_bool(raw.get("presentApresMidi")):
+                absent_pm_keys.add(nrm(nom))
+
     # Résolution unifiée : postes nommés + binômes Terrain en un seul modèle CP-SAT
     named_affectations, terrain_groups = solve_all(
-        agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets
+        agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets,
+        absent_pm_keys=absent_pm_keys,
     )
     affectations: List[dict] = named_affectations + terrain_groups
 

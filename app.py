@@ -845,26 +845,6 @@ def solve_all(
             if ag_vars:
                 model.Add(sum(ag_vars) == 1)
 
-    # ── H3 : incompatibilités postes nommés ──────────────────────────────────
-    agent_index = {ag["key"]: ai for ai, ag in enumerate(agents)}
-    for row in incompatibilities:
-        a1 = agent_index.get(row["a1"])
-        a2 = agent_index.get(row["a2"])
-        if a1 is None or a2 is None:
-            continue
-        if row["poste"] == "Terrain":
-            continue
-        check_postes = list(C.LAPI_SET) if row["poste"] == "LAPI" else (
-            [row["poste"]] if row["poste"] in C.POSTES_NAMED else C.POSTES_NAMED
-        )
-        for poste in check_postes:
-            a_slots = [x[a1, si] for si, slot in enumerate(slots)
-                       if slot["poste"] == poste and (a1, si) in x]
-            b_slots = [x[a2, si] for si, slot in enumerate(slots)
-                       if slot["poste"] == poste and (a2, si) in x]
-            if a_slots and b_slots:
-                model.Add(sum(a_slots) + sum(b_slots) <= 1)
-
     # ── S3 : quota global volontaires LAPI ───────────────────────────────────
     vol_keys = vol_targets.get("keys", set())
     for poste, cap in [("LAPI1", vol_targets.get("lapi1", 0)), ("LAPI2", vol_targets.get("lapi2", 0))]:
@@ -877,6 +857,53 @@ def solve_all(
         ]
         if all_vol_vars:
             model.Add(sum(all_vol_vars) <= max(1, cap))
+
+    # ── Anti-répétition N-1 conditionnelle ──────────────────────────────────
+    # Interdit la réaffectation au même groupe que la session précédente
+    # UNIQUEMENT si une alternative existe — jamais d'infaisabilité.
+    # Couvre : postes nommés (variables x) ET Terrain (variables y / solo).
+    _recent_postes_h = hist.get("recent_postes", {})
+    terrain_eligible_set = set(terrain_eligible)
+    for ai, agent in enumerate(agents):
+        if agent.get("heures_sup"):
+            continue  # les volontaires obéissent à la règle LAPI/BO (S3)
+        key = agent["key"]
+        rp = _recent_postes_h.get(key, [])
+        if not rp:
+            continue
+        last_group = poste_group(rp[0])
+
+        # Slots nommés appartenant au groupe répété
+        repeat_si = [
+            si for si in range(n_slots)
+            if (ai, si) in x and poste_group(slots[si]["poste"]) == last_group
+        ]
+        # Variables Terrain concernées si le dernier groupe était Terrain
+        repeat_terrain = (last_group == "Terrain" and ai in terrain_eligible_set)
+
+        if not repeat_si and not repeat_terrain:
+            continue
+
+        # Alternatives disponibles pour cet agent
+        other_named_si = [
+            si for si in range(n_slots)
+            if (ai, si) in x and poste_group(slots[si]["poste"]) != last_group
+        ]
+        # Terrain est une alternative uniquement si le groupe répété n'est PAS Terrain
+        terrain_is_alt = (ai in terrain_eligible_set and last_group != "Terrain")
+        has_alternative = bool(other_named_si) or terrain_is_alt
+
+        if has_alternative:
+            for si in repeat_si:
+                model.Add(x[ai, si] == 0)
+            if repeat_terrain:
+                for bi in terrain_eligible:
+                    if bi != ai:
+                        k = (min(ai, bi), max(ai, bi))
+                        if k in y:
+                            model.Add(y[k[0], k[1]] == 0)
+                if ai in solo:
+                    model.Add(solo[ai] == 0)
 
     # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
     # poste nommé OU binôme Terrain OU solo Terrain — aucun agent sans affectation
@@ -942,8 +969,20 @@ def solve_all(
         best = min(_candidates) if _candidates else -1
         if best >= 0:
             sc -= max(125, 500 - best * 150)
-        obj.append(_SC_TERRAIN_PAIR_WEIGHT * sc * var)
-    # solo[ai] contribue 0 à l'objectif — naturellement évité sauf nécessité
+        # Équité Terrain : déficit moyen de la paire (même échelle que postes nommés)
+        def_ai = deficits.get(ak, {}).get("Terrain", 0.0)
+        def_bi = deficits.get(bk, {}).get("Terrain", 0.0)
+        avg_def = (def_ai + def_bi) * 0.5
+        terrain_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
+                             int(avg_def * adaptive_deficit_mult)))
+        obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity) * var)
+    # solo[ai] : équité Terrain individuelle (détermine quel agent va seul si impair)
+    for ai, var in solo.items():
+        def_ai = deficits.get(agents[ai]["key"], {}).get("Terrain", 0.0)
+        solo_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
+                          int(def_ai * adaptive_deficit_mult)))
+        if solo_equity:
+            obj.append(solo_equity * var)
 
     if obj:
         model.Maximize(sum(obj))

@@ -237,7 +237,7 @@ def parse_agents(payload: dict) -> List[dict]:
 
 def parse_counts(payload: dict, demi: str = "") -> Dict[str, int]:
     params = ((payload or {}).get("workbook") or {}).get("parametres") or {}
-    is_aprem = "apres" in (demi or "").lower()
+    is_aprem = "apres" in nrm(demi or "")
 
     def get_count(key: str, default: int) -> int:
         val = params.get(key, default)

@@ -815,10 +815,14 @@ def solve_all(
             if not are_terrain_incompatible(agents[ai], agents[bi], incompatibilities):
                 y[ai, bi] = model.NewBoolVar(f"y_{ai}_{bi}")
 
-    # ── Variables solo Terrain : solo[ai] ────────────────────────────────────
-    # Score = 0 dans l'objectif → toujours dominé par un vrai binôme (≥ 500×20)
-    # Utilisé seulement si N_terrain impair ou si tous partenaires incompatibles
-    solo: Dict[int, Any] = {ai: model.NewBoolVar(f"solo_{ai}") for ai in terrain_eligible}
+    # ── Variables trinômes Terrain : trinome[ai, bi, ci] (ai < bi < ci) ────────
+    # Fallback si N_terrain impair — un agent ne peut jamais être seul sur Terrain
+    trinome: Dict[Tuple[int, int, int], Any] = {}
+    for ai, bi, ci in _iter_comb(terrain_eligible, 3):
+        if (not are_terrain_incompatible(agents[ai], agents[bi], incompatibilities)
+                and not are_terrain_incompatible(agents[ai], agents[ci], incompatibilities)
+                and not are_terrain_incompatible(agents[bi], agents[ci], incompatibilities)):
+            trinome[ai, bi, ci] = model.NewBoolVar(f"t_{ai}_{bi}_{ci}")
 
     # ── H6 : chaque slot nommé rempli exactement une fois ────────────────────
     for si, slot in enumerate(slots):
@@ -953,11 +957,12 @@ def solve_all(
                 k = (min(ai, bi), max(ai, bi))
                 if k in y:
                     model.Add(y[k[0], k[1]] == 0)
-        if ai in solo:
-            model.Add(solo[ai] == 0)
+        for k, var in trinome.items():
+            if ai in k:
+                model.Add(var == 0)
 
     # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
-    # poste nommé OU binôme Terrain OU solo Terrain — aucun agent sans affectation
+    # poste nommé OU binôme Terrain OU trinôme Terrain — jamais solo
     for ai in terrain_eligible:
         named_i = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
         pair_i = [
@@ -965,7 +970,8 @@ def solve_all(
             for bi in terrain_eligible
             if bi != ai and (min(ai, bi), max(ai, bi)) in y
         ]
-        model.Add(sum(named_i) + sum(pair_i) + solo[ai] == 1)
+        trio_i = [var for (a, b, c), var in trinome.items() if ai in (a, b, c)]
+        model.Add(sum(named_i) + sum(pair_i) + sum(trio_i) == 1)
 
     # Chaque agent dans au plus un binôme Terrain
     for ai in terrain_eligible:
@@ -1032,14 +1038,25 @@ def solve_all(
             agents[ai]["key"] in absent_pm_keys or agents[bi]["key"] in absent_pm_keys
         ) else 0
         obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity + absent_boost) * var)
-    # solo[ai] : équité Terrain individuelle (détermine quel agent va seul si impair)
-    for ai, var in solo.items():
-        def_ai = deficits.get(agents[ai]["key"], {}).get("Terrain", 0.0)
-        solo_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
-                          int(def_ai * adaptive_deficit_mult)))
-        solo_boost = C.SC_ABSENT_PM_BOOST if agents[ai]["key"] in absent_pm_keys else 0
-        if solo_equity or solo_boost:
-            obj.append((solo_equity + solo_boost) * var)
+    # trinome[ai, bi, ci] : fallback si N_terrain impair (score < binôme)
+    _TERRAIN_TRIO_BASE = 500
+    for (ai, bi, ci), var in trinome.items():
+        sc = _TERRAIN_TRIO_BASE
+        eq_i = agents[ai].get("equipe") or ""
+        eq_j = agents[bi].get("equipe") or ""
+        eq_k = agents[ci].get("equipe") or ""
+        if eq_i and eq_i == eq_j == eq_k:
+            sc += _TERRAIN_SAME_TEAM
+        ak, bk, ck = agents[ai]["key"], agents[bi]["key"], agents[ci]["key"]
+        avg_def = (deficits.get(ak, {}).get("Terrain", 0.0)
+                   + deficits.get(bk, {}).get("Terrain", 0.0)
+                   + deficits.get(ck, {}).get("Terrain", 0.0)) / 3.0
+        terrain_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
+                             int(avg_def * adaptive_deficit_mult)))
+        absent_boost = C.SC_ABSENT_PM_BOOST if any(
+            agents[idx]["key"] in absent_pm_keys for idx in (ai, bi, ci)
+        ) else 0
+        obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity + absent_boost) * var)
 
     if obj:
         model.Maximize(sum(obj))
@@ -1082,12 +1099,12 @@ def solve_all(
             terrain_paired.add(ai)
             terrain_paired.add(bi)
 
-    # Agents solo (N_terrain impair ou incompatibilités totales)
-    for ai, var in solo.items():
+    # Trinômes Terrain (N_terrain impair — jamais d'agent seul)
+    for (ai, bi, ci), var in trinome.items():
         if solver.Value(var) == 1:
             terrain_groups.append({
                 "poste": "Terrain",
-                "agents": [agents[ai]["nom"]],
+                "agents": [agents[ai]["nom"], agents[bi]["nom"], agents[ci]["nom"]],
                 "secteurs": [],
             })
 

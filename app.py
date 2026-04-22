@@ -238,13 +238,16 @@ def parse_agents(payload: dict) -> List[dict]:
 def parse_counts(payload: dict, demi: str = "") -> Dict[str, int]:
     params = ((payload or {}).get("workbook") or {}).get("parametres") or {}
     is_aprem = "apres" in nrm(demi or "")
+    has_sheet = bool(params)  # feuille fournie → 0 si poste absent ; sinon valeur par défaut
 
     def get_count(key: str, default: int) -> int:
-        val = params.get(key, default)
+        if key not in params:
+            return 0 if has_sheet else default
+        val = params[key]
         if isinstance(val, dict):
             k = "aprem" if is_aprem else "matin"
-            return int(val.get(k) or val.get("matin") or default)
-        return to_int(val, default)
+            return int(val.get(k) or val.get("matin") or 0)
+        return to_int(val, 0)
 
     return {
         "LAPI1":       get_count("LAPI 1",      2),
@@ -816,13 +819,17 @@ def solve_all(
                 y[ai, bi] = model.NewBoolVar(f"y_{ai}_{bi}")
 
     # ── Variables trinômes Terrain : trinome[ai, bi, ci] (ai < bi < ci) ────────
-    # Fallback si N_terrain impair — un agent ne peut jamais être seul sur Terrain
+    # Préféré au solo quand N_terrain impair
     trinome: Dict[Tuple[int, int, int], Any] = {}
     for ai, bi, ci in _iter_comb(terrain_eligible, 3):
         if (not are_terrain_incompatible(agents[ai], agents[bi], incompatibilities)
                 and not are_terrain_incompatible(agents[ai], agents[ci], incompatibilities)
                 and not are_terrain_incompatible(agents[bi], agents[ci], incompatibilities)):
             trinome[ai, bi, ci] = model.NewBoolVar(f"t_{ai}_{bi}_{ci}")
+
+    # ── Variables solo Terrain : fallback absolu (pénalité -10M, quasi-impossible) ──
+    # Garantit la faisabilité si toutes les paires/triples sont incompatibles
+    solo: Dict[int, Any] = {ai: model.NewBoolVar(f"solo_{ai}") for ai in terrain_eligible}
 
     # ── H6 : chaque slot nommé rempli exactement une fois ────────────────────
     for si, slot in enumerate(slots):
@@ -960,9 +967,11 @@ def solve_all(
         for k, var in trinome.items():
             if ai in k:
                 model.Add(var == 0)
+        if ai in solo:
+            model.Add(solo[ai] == 0)
 
     # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
-    # poste nommé OU binôme Terrain OU trinôme Terrain — jamais solo
+    # poste nommé OU binôme OU trinôme OU solo (fallback absolu)
     for ai in terrain_eligible:
         named_i = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
         pair_i = [
@@ -971,7 +980,7 @@ def solve_all(
             if bi != ai and (min(ai, bi), max(ai, bi)) in y
         ]
         trio_i = [var for (a, b, c), var in trinome.items() if ai in (a, b, c)]
-        model.Add(sum(named_i) + sum(pair_i) + sum(trio_i) == 1)
+        model.Add(sum(named_i) + sum(pair_i) + sum(trio_i) + solo[ai] == 1)
 
     # Chaque agent dans au plus un binôme Terrain
     for ai in terrain_eligible:
@@ -1038,6 +1047,13 @@ def solve_all(
             agents[ai]["key"] in absent_pm_keys or agents[bi]["key"] in absent_pm_keys
         ) else 0
         obj.append((_SC_TERRAIN_PAIR_WEIGHT * sc + terrain_equity + absent_boost) * var)
+    # solo[ai] : fallback absolu — pénalité -10M, choisi uniquement si aucune paire/triple possible
+    for ai, var in solo.items():
+        def_ai = deficits.get(agents[ai]["key"], {}).get("Terrain", 0.0)
+        solo_equity = max(-C.SC_DEFICIT_CAP, min(C.SC_DEFICIT_CAP,
+                          int(def_ai * adaptive_deficit_mult)))
+        obj.append((solo_equity - C.SC_SOLO_TERRAIN_PENALTY) * var)
+
     # trinome[ai, bi, ci] : fallback si N_terrain impair (score < binôme)
     _TERRAIN_TRIO_BASE = 500
     for (ai, bi, ci), var in trinome.items():
@@ -1099,12 +1115,21 @@ def solve_all(
             terrain_paired.add(ai)
             terrain_paired.add(bi)
 
-    # Trinômes Terrain (N_terrain impair — jamais d'agent seul)
+    # Trinômes Terrain
     for (ai, bi, ci), var in trinome.items():
         if solver.Value(var) == 1:
             terrain_groups.append({
                 "poste": "Terrain",
                 "agents": [agents[ai]["nom"], agents[bi]["nom"], agents[ci]["nom"]],
+                "secteurs": [],
+            })
+
+    # Solo Terrain (fallback absolu — ne devrait apparaître que si toutes les paires/triples impossibles)
+    for ai, var in solo.items():
+        if solver.Value(var) == 1:
+            terrain_groups.append({
+                "poste": "Terrain",
+                "agents": [agents[ai]["nom"]],
                 "secteurs": [],
             })
 

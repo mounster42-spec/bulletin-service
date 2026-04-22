@@ -249,7 +249,8 @@ def parse_counts(payload: dict, demi: str = "") -> Dict[str, int]:
         val = params[key]
         if isinstance(val, dict):
             k = "aprem" if is_aprem else "matin"
-            return int(val.get(k) or val.get("matin") or 0)
+            k_val = val.get(k)
+            return int(k_val if k_val is not None else val.get("matin", 0))
         return to_int(val, 0)
 
     return {

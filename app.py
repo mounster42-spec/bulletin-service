@@ -945,21 +945,40 @@ def solve_all(
             if repeat_terrain:
                 _terrain_blocks.add(ai)
 
-    # Passe 2 : poser les blocages nommés uniquement si le slot reste faisable
+    # Passe 2 : poser les blocages nommés uniquement si le groupe reste faisable
     _blocked_per_slot: Dict[int, Set[int]] = defaultdict(set)
     for ai, si in _named_blocks:
         _blocked_per_slot[si].add(ai)
+
+    # Regrouper les slots par groupe de poste pour vérifier la faisabilité globale
+    _slots_by_group: Dict[str, List[int]] = defaultdict(list)
+    for si, slot in enumerate(slots):
+        _slots_by_group[poste_group(slot["poste"])].append(si)
+
+    # Pour chaque groupe : vérifier qu'assez d'agents non-bloqués restent pour TOUS les slots
+    _groups_ok_to_block: Set[str] = set()
+    for pg, pg_slots in _slots_by_group.items():
+        n_needed = len(pg_slots)
+        blocked_in_group: Set[int] = set()
+        for sj in pg_slots:
+            blocked_in_group.update(_blocked_per_slot.get(sj, set()))
+        eligible_in_group: Set[int] = set()
+        for sj in pg_slots:
+            eligible_in_group.update(eligible_per_slot[sj])
+        non_blocked_count = len(eligible_in_group - blocked_in_group)
+        if non_blocked_count >= n_needed:
+            _groups_ok_to_block.add(pg)
 
     for si in range(n_slots):
         blocked = _blocked_per_slot.get(si, set())
         if not blocked:
             continue
-        non_blocked = [a for a in eligible_per_slot[si] if a not in blocked]
-        if non_blocked:
+        pg = poste_group(slots[si]["poste"])
+        if pg in _groups_ok_to_block:
             for ai in blocked:
                 if (ai, si) in x:
                     model.Add(x[ai, si] == 0)
-        # sinon : sous-effectif, répétition inévitable — aucun blocage posé
+        # sinon : sous-effectif global, répétition inévitable — aucun blocage posé
 
     # Passe 3 : blocages Terrain (toujours sûrs car agent a des postes nommés dispo)
     for ai in _terrain_blocks:

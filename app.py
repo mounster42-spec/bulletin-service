@@ -123,6 +123,9 @@ class C:
     # S11 Anticipation absences PM (tirage Matin d'une Journée)
     SC_ABSENT_PM_BOOST = 400_000     # préférer agents absents PM pour postes matin
 
+    # Terrain : solo quasi-interdit (binôme ≥ trinôme >> solo)
+    SC_SOLO_TERRAIN_PENALTY = 10_000_000
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # NORMALISATIONS

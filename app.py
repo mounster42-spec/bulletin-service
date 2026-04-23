@@ -770,6 +770,7 @@ def solve_all(
     incompatibilities: List[dict],
     vol_targets: dict,
     absent_pm_keys: Set[str] = frozenset(),
+    disable_antirep: bool = False,
 ) -> Tuple[List[dict], List[dict]]:
     """
     Solveur CP-SAT unifié : postes nommés + binômes Terrain en un seul modèle.
@@ -863,6 +864,21 @@ def solve_all(
             )
         model.Add(sum(slot_vars) == 1)
 
+    # ── H6b : vérification globale K agents distincts pour K slots d'un même poste ──
+    _slots_by_poste: Dict[str, List[int]] = defaultdict(list)
+    for si, slot in enumerate(slots):
+        _slots_by_poste[slot["poste"]].append(si)
+    for poste, p_slots in _slots_by_poste.items():
+        n_needed = len(p_slots)
+        eligible_union: Set[int] = set()
+        for si in p_slots:
+            eligible_union.update(eligible_per_slot[si])
+        if len(eligible_union) < n_needed:
+            raise ValueError(
+                f"Poste '{poste}' nécessite {n_needed} agent(s) distinct(s) "
+                f"mais seulement {len(eligible_union)} éligible(s) disponible(s)."
+            )
+
     # ── H7 : chaque agent au plus une fois dans les slots nommés ─────────────
     for ai in range(n):
         agent_named_vars = [x[ai, si] for si in range(n_slots) if (ai, si) in x]
@@ -909,92 +925,83 @@ def solve_all(
         if all_vol_vars:
             model.Add(sum(all_vol_vars) <= max(1, cap))
 
-    # ── Anti-répétition N-1 conditionnelle ──────────────────────────────────
-    # Interdit la réaffectation au même groupe que la session précédente
-    # UNIQUEMENT si une alternative existe — jamais d'infaisabilité.
-    # Couvre : postes nommés (variables x) ET Terrain (variables y / solo).
-    # Sécurité sous-effectif : si bloquer un agent laisserait un slot sans
-    # aucun candidat (ex. LAPI pool juste), le blocage est levé pour ce slot.
-    _recent_postes_h = hist.get("recent_postes", {})
-    terrain_eligible_set = set(terrain_eligible)
-
-    # Passe 1 : collecter les blocages candidats sans les poser
-    _named_blocks: List[Tuple[int, int]] = []
+    # ── Anti-répétition N-1 conditionnelle (désactivée en mode retry) ──────────
     _terrain_blocks: Set[int] = set()
+    if not disable_antirep:
+        _recent_postes_h = hist.get("recent_postes", {})
+        terrain_eligible_set = set(terrain_eligible)
 
-    for ai, agent in enumerate(agents):
-        if agent.get("heures_sup"):
-            continue
-        key = agent["key"]
-        rp = _recent_postes_h.get(key, [])
-        if not rp:
-            continue
-        last_group = poste_group(rp[0])
-        repeat_si = [
-            si for si in range(n_slots)
-            if (ai, si) in x and poste_group(slots[si]["poste"]) == last_group
-        ]
-        repeat_terrain = (last_group == "Terrain" and ai in terrain_eligible_set)
-        if not repeat_si and not repeat_terrain:
-            continue
-        other_named_si = [
-            si for si in range(n_slots)
-            if (ai, si) in x and poste_group(slots[si]["poste"]) != last_group
-        ]
-        terrain_is_alt = (ai in terrain_eligible_set and last_group != "Terrain")
-        if bool(other_named_si) or terrain_is_alt:
-            for si in repeat_si:
-                _named_blocks.append((ai, si))
-            if repeat_terrain:
-                _terrain_blocks.add(ai)
+        # Passe 1 : collecter les blocages candidats sans les poser
+        _named_blocks: List[Tuple[int, int]] = []
 
-    # Passe 2 : poser les blocages nommés uniquement si le groupe reste faisable
-    _blocked_per_slot: Dict[int, Set[int]] = defaultdict(set)
-    for ai, si in _named_blocks:
-        _blocked_per_slot[si].add(ai)
+        for ai, agent in enumerate(agents):
+            if agent.get("heures_sup"):
+                continue
+            key = agent["key"]
+            rp = _recent_postes_h.get(key, [])
+            if not rp:
+                continue
+            last_group = poste_group(rp[0])
+            repeat_si = [
+                si for si in range(n_slots)
+                if (ai, si) in x and poste_group(slots[si]["poste"]) == last_group
+            ]
+            repeat_terrain = (last_group == "Terrain" and ai in terrain_eligible_set)
+            if not repeat_si and not repeat_terrain:
+                continue
+            other_named_si = [
+                si for si in range(n_slots)
+                if (ai, si) in x and poste_group(slots[si]["poste"]) != last_group
+            ]
+            terrain_is_alt = (ai in terrain_eligible_set and last_group != "Terrain")
+            if bool(other_named_si) or terrain_is_alt:
+                for si in repeat_si:
+                    _named_blocks.append((ai, si))
+                if repeat_terrain:
+                    _terrain_blocks.add(ai)
 
-    # Regrouper les slots par groupe de poste pour vérifier la faisabilité globale
-    _slots_by_group: Dict[str, List[int]] = defaultdict(list)
-    for si, slot in enumerate(slots):
-        _slots_by_group[poste_group(slot["poste"])].append(si)
+        # Passe 2 : poser les blocages nommés uniquement si le groupe reste faisable
+        _blocked_per_slot: Dict[int, Set[int]] = defaultdict(set)
+        for ai, si in _named_blocks:
+            _blocked_per_slot[si].add(ai)
 
-    # Pour chaque groupe : vérifier qu'assez d'agents non-bloqués restent pour TOUS les slots
-    _groups_ok_to_block: Set[str] = set()
-    for pg, pg_slots in _slots_by_group.items():
-        n_needed = len(pg_slots)
-        blocked_in_group: Set[int] = set()
-        for sj in pg_slots:
-            blocked_in_group.update(_blocked_per_slot.get(sj, set()))
-        eligible_in_group: Set[int] = set()
-        for sj in pg_slots:
-            eligible_in_group.update(eligible_per_slot[sj])
-        non_blocked_count = len(eligible_in_group - blocked_in_group)
-        if non_blocked_count >= n_needed:
-            _groups_ok_to_block.add(pg)
+        _slots_by_group: Dict[str, List[int]] = defaultdict(list)
+        for si, slot in enumerate(slots):
+            _slots_by_group[poste_group(slot["poste"])].append(si)
 
-    for si in range(n_slots):
-        blocked = _blocked_per_slot.get(si, set())
-        if not blocked:
-            continue
-        pg = poste_group(slots[si]["poste"])
-        if pg in _groups_ok_to_block:
-            for ai in blocked:
-                if (ai, si) in x:
-                    model.Add(x[ai, si] == 0)
-        # sinon : sous-effectif global, répétition inévitable — aucun blocage posé
+        _groups_ok_to_block: Set[str] = set()
+        for pg, pg_slots in _slots_by_group.items():
+            n_needed = len(pg_slots)
+            blocked_in_group: Set[int] = set()
+            for sj in pg_slots:
+                blocked_in_group.update(_blocked_per_slot.get(sj, set()))
+            eligible_in_group: Set[int] = set()
+            for sj in pg_slots:
+                eligible_in_group.update(eligible_per_slot[sj])
+            if len(eligible_in_group - blocked_in_group) >= n_needed:
+                _groups_ok_to_block.add(pg)
 
-    # Passe 3 : blocages Terrain (toujours sûrs car agent a des postes nommés dispo)
-    for ai in _terrain_blocks:
-        for bi in terrain_eligible:
-            if bi != ai:
-                k = (min(ai, bi), max(ai, bi))
-                if k in y:
-                    model.Add(y[k[0], k[1]] == 0)
-        for k, var in trinome.items():
-            if ai in k:
-                model.Add(var == 0)
-        if ai in solo:
-            model.Add(solo[ai] == 0)
+        for si in range(n_slots):
+            blocked = _blocked_per_slot.get(si, set())
+            if not blocked:
+                continue
+            if poste_group(slots[si]["poste"]) in _groups_ok_to_block:
+                for ai in blocked:
+                    if (ai, si) in x:
+                        model.Add(x[ai, si] == 0)
+
+        # Passe 3 : blocages Terrain
+        for ai in _terrain_blocks:
+            for bi in terrain_eligible:
+                if bi != ai:
+                    k = (min(ai, bi), max(ai, bi))
+                    if k in y:
+                        model.Add(y[k[0], k[1]] == 0)
+            for k, var in trinome.items():
+                if ai in k:
+                    model.Add(var == 0)
+            if ai in solo:
+                model.Add(solo[ai] == 0)
 
     # ── Liaison : chaque agent terrain-éligible exactement une fois ──────────
     # poste nommé OU binôme OU trinôme OU solo (fallback absolu)
@@ -1111,7 +1118,7 @@ def solve_all(
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise ValueError(
-            "Aucune solution faisable trouvée. "
+            "__INFEASIBLE__ Aucune solution faisable trouvée. "
             "Vérifiez les présences, postes interdits et incompatibilités."
         )
 
@@ -1386,10 +1393,21 @@ def build_result(payload: dict) -> dict:
                 absent_pm_keys.add(nrm(nom))
 
     # Résolution unifiée : postes nommés + binômes Terrain en un seul modèle CP-SAT
-    named_affectations, terrain_groups = solve_all(
-        agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets,
-        absent_pm_keys=absent_pm_keys,
-    )
+    try:
+        named_affectations, terrain_groups = solve_all(
+            agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets,
+            absent_pm_keys=absent_pm_keys,
+        )
+    except ValueError as _e:
+        if "__INFEASIBLE__" in str(_e):
+            # Retry sans anti-répétition (contraintes croisées trop strictes)
+            named_affectations, terrain_groups = solve_all(
+                agents, slots, hist, deficits, demi, restrictions, incompatibilities, vol_targets,
+                absent_pm_keys=absent_pm_keys,
+                disable_antirep=True,
+            )
+        else:
+            raise
     affectations: List[dict] = named_affectations + terrain_groups
 
     # Allocation des secteurs

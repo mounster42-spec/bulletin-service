@@ -239,14 +239,17 @@ def parse_agents(payload: dict) -> List[dict]:
 
 
 def parse_counts(payload: dict, demi: str = "") -> Dict[str, int]:
-    params = ((payload or {}).get("workbook") or {}).get("parametres") or {}
+    params_raw = ((payload or {}).get("workbook") or {}).get("parametres") or {}
+    # Normalisation des clés pour éviter les problèmes de casse (ex. "back-office" vs "Back-office")
+    params = {nrm(k): v for k, v in params_raw.items()}
     is_aprem = "apres" in nrm(demi or "")
     has_sheet = bool(params)  # feuille fournie → 0 si poste absent ; sinon valeur par défaut
 
     def get_count(key: str, default: int) -> int:
-        if key not in params:
+        nk = nrm(key)
+        if nk not in params:
             return 0 if has_sheet else default
-        val = params[key]
+        val = params[nk]
         if isinstance(val, dict):
             k = "aprem" if is_aprem else "matin"
             k_val = val.get(k)
@@ -1358,9 +1361,11 @@ def build_result(payload: dict) -> dict:
     slots = build_slots(counts, forced_teams)
 
     if len(slots) > len(agents):
+        counts_str = ", ".join(f"{k}={v}" for k, v in counts.items() if v > 0)
         raise ValueError(
             f"Pas assez d'agents présents ({len(agents)}) "
-            f"pour couvrir les {len(slots)} postes demandés."
+            f"pour couvrir les {len(slots)} postes demandés "
+            f"[demi={demi!r}, {counts_str}]"
         )
 
     demi_ctx, restrictions = parse_restrictions(payload)
